@@ -1,9 +1,9 @@
 // clawtop is a TUI dashboard for Anthropic Claude usage. It merges per-machine
-// status JSON files (written by clawtopd) into a unified view with multiple
-// tabs: rate limits, project breakdown, model split, and a 24h sparkline.
+// status JSON files (written by clawtopd) into a unified view.
 //
-// Designed to run inside a tmux session on a homelab server, but any terminal
-// with at least 60 columns works.
+// Default layout is a single-screen dashboard (limits, projects, models, and a
+// 24h sparkline visible at once). On narrow or short terminals it falls back
+// to a tabbed layout, switchable with the `t` key.
 package main
 
 import (
@@ -48,9 +48,7 @@ func main() {
 
 // expandHome resolves a leading "~" or "~/" to the current user's home
 // directory. Needed because shells (bash, zsh) do not tilde-expand the
-// value side of --flag=value arguments, so users writing
-// `clawtop --dir=~/.local/share/clawtop` would otherwise get the literal
-// tilde as the path.
+// value side of --flag=value arguments.
 func expandHome(p string) string {
 	if p == "~" {
 		if h, err := os.UserHomeDir(); err == nil {
@@ -68,13 +66,16 @@ func expandHome(p string) string {
 type tickMsg time.Time
 
 type model struct {
-	dir      string
-	merged   merger.Merged
-	loadErr  error
-	count    int
-	tab      int
-	width    int
-	height   int
+	dir             string
+	merged          merger.Merged
+	loadErr         error
+	count           int
+	tab             int
+	width           int
+	height          int
+	forceTabbed     bool // user toggled to tabbed even though dashboard would fit
+	forceDashboard  bool // user toggled to dashboard even though terminal is small
+	scrollProjects  int
 }
 
 func initialModel(dir string) model {
@@ -96,6 +97,54 @@ func (m *model) reload() {
 	if err == nil {
 		m.merged = merger.Merge(parts)
 	}
+	// Re-clamp scroll in case the project list shrank.
+	maxScroll := m.maxProjectScroll(m.projectsVisible())
+	if m.scrollProjects > maxScroll {
+		m.scrollProjects = maxScroll
+	}
+}
+
+// dashboardFits returns true when the terminal is big enough for the
+// single-screen layout.
+func (m model) dashboardFits() bool {
+	return m.width >= 100 && m.height >= 22
+}
+
+func (m model) useDashboard() bool {
+	if m.forceTabbed {
+		return false
+	}
+	if m.forceDashboard {
+		return true
+	}
+	return m.dashboardFits()
+}
+
+// projectsVisible returns how many project rows fit in the current layout.
+func (m model) projectsVisible() int {
+	if m.useDashboard() {
+		// Dashboard reserves space for limits (4), models column (5+),
+		// sparkline (4), header (1), and footer (2).
+		n := m.height - 16
+		if n < 3 {
+			return 3
+		}
+		return n
+	}
+	// Tabbed projects view uses (height - header - footer - spacing).
+	n := m.height - 6
+	if n < 5 {
+		return 5
+	}
+	return n
+}
+
+func (m model) maxProjectScroll(visible int) int {
+	n := len(m.merged.ByProject) - visible
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -110,23 +159,59 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.reload()
 			return m, nil
+		case "t":
+			// Toggle layout mode and remember the user's intent.
+			if m.useDashboard() {
+				m.forceTabbed, m.forceDashboard = true, false
+			} else {
+				m.forceTabbed, m.forceDashboard = false, true
+			}
+			return m, nil
 		case "tab", "right", "l":
-			m.tab = (m.tab + 1) % tabCount
+			if !m.useDashboard() {
+				m.tab = (m.tab + 1) % tabCount
+			}
 			return m, nil
 		case "shift+tab", "left", "h":
-			m.tab = (m.tab + tabCount - 1) % tabCount
+			if !m.useDashboard() {
+				m.tab = (m.tab + tabCount - 1) % tabCount
+			}
 			return m, nil
-		case "1":
-			m.tab = tabLimits
+		case "1", "2", "3", "4":
+			if !m.useDashboard() {
+				m.tab = int(msg.String()[0] - '1')
+			}
 			return m, nil
-		case "2":
-			m.tab = tabProjects
+		case "j", "down":
+			vis := m.projectsVisible()
+			if m.scrollProjects < m.maxProjectScroll(vis) {
+				m.scrollProjects++
+			}
 			return m, nil
-		case "3":
-			m.tab = tabModels
+		case "k", "up":
+			if m.scrollProjects > 0 {
+				m.scrollProjects--
+			}
 			return m, nil
-		case "4":
-			m.tab = tabHourly
+		case "g":
+			m.scrollProjects = 0
+			return m, nil
+		case "G":
+			m.scrollProjects = m.maxProjectScroll(m.projectsVisible())
+			return m, nil
+		case "pgdown", " ":
+			vis := m.projectsVisible()
+			m.scrollProjects += vis
+			if max := m.maxProjectScroll(vis); m.scrollProjects > max {
+				m.scrollProjects = max
+			}
+			return m, nil
+		case "pgup":
+			vis := m.projectsVisible()
+			m.scrollProjects -= vis
+			if m.scrollProjects < 0 {
+				m.scrollProjects = 0
+			}
 			return m, nil
 		}
 	case tickMsg:
@@ -136,7 +221,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ---- view -----------------------------------------------------------------
+// ---- styles ---------------------------------------------------------------
 
 var (
 	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
@@ -146,20 +231,196 @@ var (
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	okStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
 	warnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	neutralBar  = lipgloss.NewStyle().Foreground(lipgloss.Color("39")) // cyan
 	activeTab   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Underline(true)
 	inactiveTab = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	box         = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("240")).
-			Padding(1, 2)
+	padding     = lipgloss.NewStyle().PaddingLeft(1).PaddingRight(1)
 )
 
 func (m model) View() string {
 	if m.count == 0 {
-		return box.Render(errStyle.Render("no status files in " + m.dir) +
-			dimStyle.Render("\nis clawtopd running and pushing here?"))
+		return padding.Render(errStyle.Render("no status files in "+m.dir) + "\n" +
+			dimStyle.Render("is clawtopd running and pushing here?"))
+	}
+	if m.useDashboard() {
+		return m.viewDashboard()
+	}
+	return m.viewTabbed()
+}
+
+// ---- dashboard view (default) ---------------------------------------------
+
+func (m model) viewDashboard() string {
+	w := m.width
+	if w > 200 {
+		w = 200
+	}
+	innerW := w - 2 // padding(1, 1)
+
+	merged := m.merged
+
+	// Header line: title + hosts + window + freshness.
+	staleness := freshnessLabel(merged.Machines)
+	hostsLabel := fmt.Sprintf("hosts: %d (%s)", len(merged.Machines), joinHosts(merged.Machines))
+	header := titleStyle.Render("clawtop") +
+		dimStyle.Render("  ·  "+time.Now().Format("15:04:05")+"  ·  "+hostsLabel+
+			"  window: "+fallback(merged.Window, "?")+"  ") + staleness
+
+	// Limits section: two compact bars side by side or stacked.
+	limitsW := innerW
+	limits := dashboardLimits(merged, limitsW)
+
+	// Projects + Models side by side.
+	leftW := innerW * 60 / 100
+	rightW := innerW - leftW - 2 // 2 for gap
+	if leftW < 40 {
+		leftW = 40
+	}
+	if rightW < 25 {
+		rightW = innerW - leftW - 2
+		if rightW < 25 {
+			rightW = 25
+		}
+	}
+	visible := m.projectsVisible()
+	leftCol := dashboardProjects(merged, leftW, visible, m.scrollProjects)
+	rightCol := dashboardModels(merged, rightW)
+	cols := lipgloss.JoinHorizontal(lipgloss.Top, leftCol, "  ", rightCol)
+
+	hourly := dashboardHourly(merged, innerW)
+
+	keys := dimStyle.Render("q quit · r reload · t tabbed · j/k g G PgUp/PgDn scroll projects")
+
+	body := strings.Join([]string{
+		header,
+		"",
+		limits,
+		"",
+		cols,
+		"",
+		hourly,
+		"",
+		keys,
+	}, "\n")
+	return padding.Render(body)
+}
+
+func dashboardLimits(m merger.Merged, w int) string {
+	barW := w - 30
+	if barW < 10 {
+		barW = 10
+	}
+	return strings.Join([]string{
+		fmt.Sprintf("%-8s %s  %s   %s",
+			labelStyle.Render("SESSION"),
+			barRanked(m.Session.Pct, barW),
+			pct(m.Session.Pct),
+			dimStyle.Render("resets "+short(m.Session.ResetIn()))),
+		fmt.Sprintf("%-8s %s  %s   %s",
+			labelStyle.Render("WEEK"),
+			barRanked(m.Week.Pct, barW),
+			pct(m.Week.Pct),
+			dimStyle.Render("resets "+short(m.Week.ResetIn()))),
+		dimStyle.Render("plan: "+fallback(m.Subscription, "?")+"    limit: "+fallback(m.Limit, "?")),
+	}, "\n")
+}
+
+func dashboardProjects(m merger.Merged, w, visible, scroll int) string {
+	header := labelStyle.Render(fmt.Sprintf("TOP PROJECTS (last %s)", fallback(m.Window, "?")))
+	if len(m.ByProject) == 0 {
+		return strings.Join([]string{header, "", dimStyle.Render("no transcript data yet")}, "\n")
 	}
 
+	var maxT int64
+	for _, p := range m.ByProject {
+		if p.Total() > maxT {
+			maxT = p.Total()
+		}
+	}
+	nameW := w * 45 / 100
+	if nameW < 16 {
+		nameW = 16
+	}
+	numW := 10
+	barW := w - nameW - numW - 2
+	if barW < 6 {
+		barW = 6
+	}
+
+	rows := []string{header, ""}
+	end := scroll + visible
+	if end > len(m.ByProject) {
+		end = len(m.ByProject)
+	}
+	for i := scroll; i < end; i++ {
+		p := m.ByProject[i]
+		ratio := 0.0
+		if maxT > 0 {
+			ratio = float64(p.Total()) / float64(maxT) * 100
+		}
+		rows = append(rows, fmt.Sprintf("%-*s %s %s",
+			nameW, truncate(p.Name, nameW),
+			pad(fmtTokens(p.Total()), numW),
+			barNeutral(ratio, barW),
+		))
+	}
+
+	hint := ""
+	if scroll > 0 && end < len(m.ByProject) {
+		hint = fmt.Sprintf("▲ %d above · %d below ▼", scroll, len(m.ByProject)-end)
+	} else if scroll > 0 {
+		hint = fmt.Sprintf("▲ %d above", scroll)
+	} else if end < len(m.ByProject) {
+		hint = fmt.Sprintf("%d below ▼", len(m.ByProject)-end)
+	}
+	if hint != "" {
+		rows = append(rows, dimStyle.Render(hint))
+	}
+	return strings.Join(rows, "\n")
+}
+
+func dashboardModels(m merger.Merged, w int) string {
+	header := labelStyle.Render(fmt.Sprintf("MODELS (last %s)", fallback(m.Window, "?")))
+	if len(m.ByModel) == 0 {
+		return strings.Join([]string{header, "", dimStyle.Render("no transcript data yet")}, "\n")
+	}
+	rows := []string{header, ""}
+	for _, mm := range m.ByModel {
+		rows = append(rows,
+			fmt.Sprintf("%-*s %s", w-10, truncate(prettyModel(mm.Model), w-10),
+				pad(fmtTokens(mm.Total()), 9)),
+			dimStyle.Render(fmt.Sprintf("  in=%s  out=%s",
+				fmtTokens(mm.In), fmtTokens(mm.Out))),
+			dimStyle.Render(fmt.Sprintf("  cache_read=%s  cache_create=%s",
+				fmtTokens(mm.CacheR), fmtTokens(mm.CacheC))),
+			"",
+		)
+	}
+	return strings.Join(rows, "\n")
+}
+
+func dashboardHourly(m merger.Merged, w int) string {
+	header := labelStyle.Render("LAST 24h")
+	if len(m.Hourly24h) == 0 {
+		return strings.Join([]string{header, dimStyle.Render("no transcript data yet")}, "\n")
+	}
+	var sum int64
+	for _, v := range m.Hourly24h {
+		sum += v
+	}
+	totals := dimStyle.Render(fmt.Sprintf("total %s · peak %s",
+		fmtTokens(sum), fmtTokens(maxInt64(m.Hourly24h))))
+	barRoom := w - lipgloss.Width(totals) - 11 // "LAST 24h " + spacing
+	if barRoom < 10 {
+		barRoom = w - 11
+	}
+	spark := sparkline(m.Hourly24h, barRoom)
+	return header + " " + spark + "  " + totals
+}
+
+// ---- tabbed view (fallback for small terminals) ---------------------------
+
+func (m model) viewTabbed() string {
 	w := m.width
 	if w < 60 {
 		w = 60
@@ -167,14 +428,14 @@ func (m model) View() string {
 	if w > 110 {
 		w = 110
 	}
-	innerW := w - 6
+	innerW := w - 2
 
 	var body string
 	switch m.tab {
 	case tabLimits:
 		body = viewLimits(m.merged, innerW)
 	case tabProjects:
-		body = viewProjects(m.merged, innerW)
+		body = viewProjects(m.merged, innerW, m.projectsVisible(), m.scrollProjects)
 	case tabModels:
 		body = viewModels(m.merged, innerW)
 	case tabHourly:
@@ -186,7 +447,7 @@ func (m model) View() string {
 		"   " + tabsRow(m.tab)
 	footer := footerLine(m.merged, innerW)
 
-	return box.Render(strings.Join([]string{header, "", body, "", footer}, "\n"))
+	return padding.Render(strings.Join([]string{header, "", body, "", footer}, "\n"))
 }
 
 func tabsRow(active int) string {
@@ -203,28 +464,10 @@ func tabsRow(active int) string {
 }
 
 func footerLine(m merger.Merged, w int) string {
-	hosts := make([]string, len(m.Machines))
-	oldest := time.Duration(0)
-	now := time.Now()
-	for i, mi := range m.Machines {
-		hosts[i] = mi.Name
-		age := now.Sub(time.Unix(mi.TS, 0))
-		if age > oldest {
-			oldest = age
-		}
-	}
-	staleness := okStyle.Render("fresh")
-	switch {
-	case oldest > 5*time.Minute:
-		staleness = errStyle.Render("stale " + short(oldest))
-	case oldest > 2*time.Minute:
-		staleness = warnStyle.Render("stale " + short(oldest))
-	}
 	left := fmt.Sprintf("hosts: %d (%s)  window: %s  ",
-		len(m.Machines), strings.Join(hosts, ","), fallback(m.Window, "?"))
-	right := "tab/← → switch · 1-4 jump · r reload · q quit"
-	// Pad using lipgloss.Width so ANSI escapes in `staleness` don't throw
-	// off the alignment.
+		len(m.Machines), joinHosts(m.Machines), fallback(m.Window, "?"))
+	staleness := freshnessLabel(m.Machines)
+	right := "tab/← → switch · 1-4 jump · t dash · r reload · q quit"
 	used := lipgloss.Width(left) + lipgloss.Width(staleness) + lipgloss.Width(right)
 	gap := w - used
 	if gap < 1 {
@@ -233,29 +476,22 @@ func footerLine(m merger.Merged, w int) string {
 	return dimStyle.Render(left) + staleness + strings.Repeat(" ", gap) + dimStyle.Render(right)
 }
 
-// ---- tab: limits ----------------------------------------------------------
-
 func viewLimits(m merger.Merged, w int) string {
 	barW := w - 12
-	lines := []string{
+	return strings.Join([]string{
 		labelStyle.Render("SESSION  (5h)"),
-		bar(m.Session.Pct, barW) + "  " + pct(m.Session.Pct),
+		barRanked(m.Session.Pct, barW) + "  " + pct(m.Session.Pct),
 		dimStyle.Render("resets in " + short(m.Session.ResetIn())),
 		"",
 		labelStyle.Render("WEEK     (7d)"),
-		bar(m.Week.Pct, barW) + "  " + pct(m.Week.Pct),
+		barRanked(m.Week.Pct, barW) + "  " + pct(m.Week.Pct),
 		dimStyle.Render("resets in " + short(m.Week.ResetIn())),
 		"",
-		dimStyle.Render(fmt.Sprintf(
-			"plan: %s    limit: %s",
-			fallback(m.Subscription, "?"), fallback(m.Limit, "?"))),
-	}
-	return strings.Join(lines, "\n")
+		dimStyle.Render("plan: " + fallback(m.Subscription, "?") + "    limit: " + fallback(m.Limit, "?")),
+	}, "\n")
 }
 
-// ---- tab: projects --------------------------------------------------------
-
-func viewProjects(m merger.Merged, w int) string {
+func viewProjects(m merger.Merged, w, visible, scroll int) string {
 	if len(m.ByProject) == 0 {
 		return dimStyle.Render("no transcript data yet")
 	}
@@ -272,29 +508,29 @@ func viewProjects(m merger.Merged, w int) string {
 	if barW < 10 {
 		barW = 10
 	}
-
-	lines := []string{header, ""}
-	for i, p := range m.ByProject {
-		if i >= 10 {
-			break
-		}
-		name := truncate(p.Name, nameW)
+	rows := []string{header, ""}
+	end := scroll + visible
+	if end > len(m.ByProject) {
+		end = len(m.ByProject)
+	}
+	for i := scroll; i < end; i++ {
+		p := m.ByProject[i]
 		ratio := 0.0
 		if maxT > 0 {
 			ratio = float64(p.Total()) / float64(maxT) * 100
 		}
-		lines = append(lines, fmt.Sprintf(
-			"%-*s %s  %s",
-			nameW, name, bar(ratio, barW), pad(fmtTokens(p.Total()), numW),
+		rows = append(rows, fmt.Sprintf("%-*s %s  %s",
+			nameW, truncate(p.Name, nameW),
+			barNeutral(ratio, barW),
+			pad(fmtTokens(p.Total()), numW),
 		))
 	}
-	if len(m.ByProject) > 10 {
-		lines = append(lines, dimStyle.Render(fmt.Sprintf("... and %d more", len(m.ByProject)-10)))
+	if scroll > 0 || end < len(m.ByProject) {
+		rows = append(rows, dimStyle.Render(fmt.Sprintf("showing %d-%d of %d · j/k g G PgUp/PgDn",
+			scroll+1, end, len(m.ByProject))))
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(rows, "\n")
 }
-
-// ---- tab: models ----------------------------------------------------------
 
 func viewModels(m merger.Merged, w int) string {
 	if len(m.ByModel) == 0 {
@@ -313,29 +549,25 @@ func viewModels(m merger.Merged, w int) string {
 	if barW < 10 {
 		barW = 10
 	}
-
-	lines := []string{header, ""}
+	rows := []string{header, ""}
 	for _, mm := range m.ByModel {
 		ratio := 0.0
 		if maxT > 0 {
 			ratio = float64(mm.Total()) / float64(maxT) * 100
 		}
-		lines = append(lines, fmt.Sprintf(
-			"%-*s %s  %s",
-			nameW, truncate(prettyModel(mm.Model), nameW),
-			bar(ratio, barW), pad(fmtTokens(mm.Total()), numW),
-		))
-		lines = append(lines, dimStyle.Render(fmt.Sprintf(
-			"%-*s  in=%s  out=%s  cache_read=%s  cache_create=%s",
-			nameW, "",
-			fmtTokens(mm.In), fmtTokens(mm.Out),
-			fmtTokens(mm.CacheR), fmtTokens(mm.CacheC),
-		)))
+		rows = append(rows,
+			fmt.Sprintf("%-*s %s  %s",
+				nameW, truncate(prettyModel(mm.Model), nameW),
+				barNeutral(ratio, barW),
+				pad(fmtTokens(mm.Total()), numW)),
+			dimStyle.Render(fmt.Sprintf("%-*s  in=%s  out=%s  cache_read=%s  cache_create=%s",
+				nameW, "",
+				fmtTokens(mm.In), fmtTokens(mm.Out),
+				fmtTokens(mm.CacheR), fmtTokens(mm.CacheC))),
+		)
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(rows, "\n")
 }
-
-// ---- tab: hourly ----------------------------------------------------------
 
 func viewHourly(m merger.Merged, w int) string {
 	header := labelStyle.Render("LAST 24h (tokens per hour, all machines combined)")
@@ -353,22 +585,12 @@ func viewHourly(m merger.Merged, w int) string {
 	return strings.Join([]string{header, "", spark, axisRow, "", scaleRow}, "\n")
 }
 
-// ---- helpers --------------------------------------------------------------
+// ---- shared helpers -------------------------------------------------------
 
-func bar(pct float64, width int) string {
-	if width < 4 {
-		width = 4
-	}
-	if pct < 0 {
-		pct = 0
-	}
-	if pct > 100 {
-		pct = 100
-	}
-	filled := int(float64(width) * pct / 100)
-	if filled > width {
-		filled = width
-	}
+// barRanked colors the bar by percentage (green→yellow→orange→red). Use for
+// rate-limit windows where high values are bad.
+func barRanked(pct float64, width int) string {
+	filled, rest := barCells(pct, width)
 	color := lipgloss.Color("82")
 	switch {
 	case pct >= 90:
@@ -378,16 +600,43 @@ func bar(pct float64, width int) string {
 	case pct >= 50:
 		color = lipgloss.Color("226")
 	}
-	full := lipgloss.NewStyle().Foreground(color).Render(strings.Repeat("█", filled))
-	rest := dimStyle.Render(strings.Repeat("░", width-filled))
-	return full + rest
+	return lipgloss.NewStyle().Foreground(color).Render(strings.Repeat("█", filled)) +
+		dimStyle.Render(strings.Repeat("░", rest))
+}
+
+// barNeutral is a single-color bar suitable for relative comparisons (project
+// rank, model split) where the value doesn't carry good/bad semantics.
+func barNeutral(pct float64, width int) string {
+	filled, rest := barCells(pct, width)
+	return neutralBar.Render(strings.Repeat("█", filled)) +
+		dimStyle.Render(strings.Repeat("░", rest))
+}
+
+func barCells(pct float64, width int) (filled, rest int) {
+	if width < 4 {
+		width = 4
+	}
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	filled = int(float64(width) * pct / 100)
+	if filled > width {
+		filled = width
+	}
+	rest = width - filled
+	return
 }
 
 var sparkRunes = []rune("▁▂▃▄▅▆▇█")
 
 func sparkline(values []int64, width int) string {
+	if width < 4 {
+		width = 4
+	}
 	if width < len(values) {
-		// Compress: each output column is the average of N values.
 		out := make([]int64, width)
 		group := len(values) / width
 		if group < 1 {
@@ -407,7 +656,6 @@ func sparkline(values []int64, width int) string {
 		}
 		values = out
 	} else if width > len(values) {
-		// Stretch: each input fills W/N columns.
 		stretch := width / len(values)
 		out := make([]int64, 0, width)
 		for _, v := range values {
@@ -420,7 +668,6 @@ func sparkline(values []int64, width int) string {
 		}
 		values = out
 	}
-
 	max := maxInt64(values)
 	if max == 0 {
 		return dimStyle.Render(strings.Repeat("▁", width))
@@ -436,7 +683,7 @@ func sparkline(values []int64, width int) string {
 		}
 		b.WriteRune(sparkRunes[idx])
 	}
-	return okStyle.Render(b.String())
+	return neutralBar.Render(b.String())
 }
 
 func pct(v float64) string {
@@ -482,7 +729,6 @@ func fmtTokens(n int64) string {
 }
 
 func prettyModel(m string) string {
-	// "claude-opus-4-7" → "opus-4-7"; "claude-sonnet-4-6" → "sonnet-4-6".
 	if strings.HasPrefix(m, "claude-") {
 		return strings.TrimPrefix(m, "claude-")
 	}
@@ -521,6 +767,33 @@ func maxInt64(xs []int64) int64 {
 		}
 	}
 	return m
+}
+
+func joinHosts(ms []merger.MachineInfo) string {
+	names := make([]string, len(ms))
+	for i, m := range ms {
+		names[i] = m.Name
+	}
+	return strings.Join(names, ",")
+}
+
+func freshnessLabel(ms []merger.MachineInfo) string {
+	oldest := time.Duration(0)
+	now := time.Now()
+	for _, mi := range ms {
+		age := now.Sub(time.Unix(mi.TS, 0))
+		if age > oldest {
+			oldest = age
+		}
+	}
+	switch {
+	case oldest > 5*time.Minute:
+		return errStyle.Render("stale " + short(oldest))
+	case oldest > 2*time.Minute:
+		return warnStyle.Render("stale " + short(oldest))
+	default:
+		return okStyle.Render("fresh")
+	}
 }
 
 func loadAll(dir string) ([]domain.Status, int, error) {
