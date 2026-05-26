@@ -1,0 +1,14 @@
+[Unit]
+Description=clawtop daemon (single-PC mode: writes JSON to local filesystem)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/clawtopd --host=localhost --dir=%h/.local/share/clawtop --interval=60s
+Restart=on-failure
+RestartSec=10s
+# Reads ~/.claude/.credentials.json owned by this user; no privilege escalation.
+
+[Install]
+WantedBy=default.target

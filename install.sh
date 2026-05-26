@@ -10,21 +10,38 @@
 #
 # Honors $CLAWTOP_VERSION (defaults to latest) and $CLAWTOP_BIN_DIR
 # (defaults to ~/.local/bin).
+#
+# This script ONLY installs binaries. It does not configure systemd, SSH,
+# or daemon flags. After install, follow:
+#   https://github.com/leonardorifeli/clawtop/blob/main/deploy/INSTALL.md
 
 set -eu
 
 REPO="leonardorifeli/clawtop"
-WHAT="${1:-both}"
 BIN_DIR="${CLAWTOP_BIN_DIR:-$HOME/.local/bin}"
 VERSION="${CLAWTOP_VERSION:-}"
 
-die() { printf '%s\n' "error: $*" >&2; exit 1; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 info() { printf '==> %s\n' "$*"; }
 
-case "$WHAT" in
-  daemon|viewer|both) ;;
-  *) die "unknown target '$WHAT' (expected: daemon, viewer, both)" ;;
-esac
+WHAT="both"
+# Accept at most one positional arg: daemon | viewer | both. Anything else
+# is rejected with a clear error so users don't silently miscompose flags
+# (e.g. `install.sh daemon --host=foo` — host config goes in the systemd
+# unit, not in this script).
+if [ $# -gt 1 ]; then
+  die "too many arguments. Usage: install.sh [daemon|viewer|both]"
+fi
+if [ $# -eq 1 ]; then
+  case "$1" in
+    daemon|viewer|both) WHAT="$1" ;;
+    -h|--help)
+      sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) die "unknown argument '$1'. Expected: daemon, viewer, or both" ;;
+  esac
+fi
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$OS" in
@@ -80,7 +97,7 @@ esac
 cat <<EOF
 
 Next steps:
-  - Daemon hosts: see https://github.com/$REPO/blob/main/deploy/INSTALL.md#2-daemon
-  - Viewer host:  see https://github.com/$REPO/blob/main/deploy/INSTALL.md#3-viewer
+  clawtopd doctor                                     # verify setup
+  https://github.com/$REPO#quickstart                 # single-PC or multi-PC walkthrough
 
 EOF

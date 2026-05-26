@@ -53,8 +53,10 @@ nfpms:
     formats: [deb, rpm]
     bindir: /usr/bin
     contents:
-      - src: deploy/clawtopd.service
-        dst: /usr/lib/systemd/user/clawtopd.service
+      - src: deploy/clawtopd-local.service
+        dst: /usr/lib/systemd/user/clawtopd-local.service
+      - src: deploy/clawtopd-remote.service
+        dst: /usr/lib/systemd/user/clawtopd-remote.service
       - src: deploy/clawtop.service
         dst: /usr/lib/systemd/user/clawtop.service
       - src: README.md

@@ -1,7 +1,13 @@
 // clawtopd polls Anthropic for rate-limit headers, aggregates local Claude
-// Code transcripts, and pushes a per-machine status JSON to a remote host
-// via SSH. Runs on the same machine that holds the Claude OAuth credentials;
-// the credentials never leave this host.
+// Code transcripts, and writes a per-machine status JSON. When --host is
+// "localhost" (default) it writes to the local filesystem; otherwise it
+// pushes to the remote host via SSH.
+//
+// Subcommands:
+//
+//	clawtopd               run the daemon (default)
+//	clawtopd doctor        preflight check: credentials, Anthropic, destination
+//	clawtopd help          print usage
 package main
 
 import (
@@ -27,35 +33,98 @@ import (
 var safeID = regexp.MustCompile(`[^a-zA-Z0-9_.-]+`)
 
 func main() {
-	defaultCreds := filepath.Join(os.Getenv("HOME"), ".claude", ".credentials.json")
-	host, _ := os.Hostname()
-
-	var (
-		credsPath    = flag.String("creds", defaultCreds, "path to Claude OAuth credentials JSON")
-		remoteHost   = flag.String("host", "localhost", "ssh_config alias of the viewer host (or 'localhost' to write locally)")
-		remoteDir    = flag.String("remote-dir", "/var/lib/clawtop", "remote directory for per-machine status JSON files")
-		machineID    = flag.String("machine", safeID.ReplaceAllString(host, "-"), "stable identifier for this machine (used as filename)")
-		projectsRoot = flag.String("projects", collector.DefaultRoot(), "Claude Code transcripts directory")
-		windowFlag   = flag.Duration("window", 7*24*time.Hour, "aggregation lookback window")
-		interval     = flag.Duration("interval", 60*time.Second, "poll interval")
-		once         = flag.Bool("once", false, "probe once and exit (useful for testing)")
-		localOnly    = flag.Bool("local-only", false, "do not push; print status JSON to stdout")
-		skipProbe    = flag.Bool("skip-probe", false, "do not call Anthropic; aggregate transcripts only")
-	)
-	flag.Parse()
-
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.SetOutput(os.Stderr)
 
-	if *machineID == "" {
-		log.Fatal("--machine required when hostname is empty")
+	args := os.Args[1:]
+	cmd := ""
+	if len(args) > 0 {
+		switch args[0] {
+		case "doctor", "run", "help", "-h", "--help":
+			cmd = args[0]
+			args = args[1:]
+		}
 	}
 
-	client := anthropic.New(*credsPath)
-	pusher := push.SSH{
-		Host: *remoteHost,
-		Path: path.Join(*remoteDir, *machineID+".json"),
+	switch cmd {
+	case "doctor":
+		os.Exit(runDoctor(args))
+	case "help", "-h", "--help":
+		printUsage()
+	default:
+		runDaemon(args)
 	}
+}
+
+func printUsage() {
+	fmt.Fprintln(os.Stderr, `clawtopd — push Claude usage to a viewer
+
+Usage:
+  clawtopd [flags]            run the daemon
+  clawtopd doctor [flags]     preflight check
+  clawtopd help               this help
+
+Run 'clawtopd -h' or 'clawtopd doctor -h' for flag details.`)
+}
+
+type runConfig struct {
+	credsPath    string
+	host         string
+	dir          string
+	machineID    string
+	projectsRoot string
+	window       time.Duration
+	interval     time.Duration
+	once         bool
+	localOnly    bool
+	skipProbe    bool
+}
+
+func parseRunFlags(args []string) *runConfig {
+	fs := flag.NewFlagSet("clawtopd", flag.ExitOnError)
+	defaultCreds := filepath.Join(os.Getenv("HOME"), ".claude", ".credentials.json")
+	host, _ := os.Hostname()
+
+	cfg := &runConfig{}
+	fs.StringVar(&cfg.credsPath, "creds", defaultCreds, "path to Claude OAuth credentials JSON")
+	fs.StringVar(&cfg.host, "host", "localhost", `destination: "localhost" writes locally, anything else is treated as an ssh_config alias and the payload is pushed via SSH`)
+	fs.StringVar(&cfg.dir, "dir", "", "directory for the status JSON (default: ~/.local/share/clawtop for localhost, /var/lib/clawtop for SSH)")
+	fs.StringVar(&cfg.machineID, "machine", safeID.ReplaceAllString(host, "-"), "stable identifier for this machine (used as filename)")
+	fs.StringVar(&cfg.projectsRoot, "projects", collector.DefaultRoot(), "Claude Code transcripts directory")
+	fs.DurationVar(&cfg.window, "window", 7*24*time.Hour, "aggregation lookback window")
+	fs.DurationVar(&cfg.interval, "interval", 60*time.Second, "poll interval")
+	fs.BoolVar(&cfg.once, "once", false, "probe once and exit (useful for testing)")
+	fs.BoolVar(&cfg.localOnly, "local-only", false, "do not push; print status JSON to stdout")
+	fs.BoolVar(&cfg.skipProbe, "skip-probe", false, "do not call Anthropic; aggregate transcripts only")
+	_ = fs.Parse(args)
+
+	if cfg.dir == "" {
+		if cfg.host == "localhost" {
+			cfg.dir = filepath.Join(os.Getenv("HOME"), ".local", "share", "clawtop")
+		} else {
+			cfg.dir = "/var/lib/clawtop"
+		}
+	}
+	if cfg.machineID == "" {
+		log.Fatal("--machine required when hostname is empty")
+	}
+	return cfg
+}
+
+// newPusher returns the appropriate Pusher for the configured host.
+// "localhost" → local file; any other value → SSH alias.
+func newPusher(cfg *runConfig) push.Pusher {
+	target := path.Join(cfg.dir, cfg.machineID+".json")
+	if cfg.host == "localhost" {
+		return push.Local{Path: target}
+	}
+	return push.SSH{Host: cfg.host, Path: target}
+}
+
+func runDaemon(args []string) {
+	cfg := parseRunFlags(args)
+	client := anthropic.New(cfg.credsPath)
+	pusher := newPusher(cfg)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -66,12 +135,12 @@ func main() {
 
 		s := &domain.Status{
 			Schema:  domain.Version,
-			Machine: *machineID,
+			Machine: cfg.machineID,
 			TS:      time.Now().Unix(),
-			Window:  shortWindow(*windowFlag),
+			Window:  shortWindow(cfg.window),
 		}
 
-		if !*skipProbe {
+		if !cfg.skipProbe {
 			probed, err := client.Probe(probeCtx)
 			if err != nil {
 				log.Printf("probe: %v", err)
@@ -84,8 +153,8 @@ func main() {
 		}
 
 		agg, err := collector.Collect(collector.Options{
-			Root:   *projectsRoot,
-			Window: *windowFlag,
+			Root:   cfg.projectsRoot,
+			Window: cfg.window,
 		})
 		if err != nil {
 			log.Printf("collect: %v", err)
@@ -96,7 +165,7 @@ func main() {
 		}
 
 		payload, _ := json.Marshal(s)
-		if *localOnly {
+		if cfg.localOnly {
 			os.Stdout.Write(payload)
 			os.Stdout.WriteString("\n")
 			return
@@ -105,16 +174,16 @@ func main() {
 			log.Printf("push: %v", err)
 			return
 		}
-		log.Printf("ok machine=%s session=%.1f%% week=%.1f%% projects=%d models=%d",
-			*machineID, s.Session.Pct, s.Week.Pct, len(s.ByProject), len(s.ByModel))
+		log.Printf("ok machine=%s session=%.1f%% week=%.1f%% projects=%d models=%d via=%s",
+			cfg.machineID, s.Session.Pct, s.Week.Pct, len(s.ByProject), len(s.ByModel), pusher.Describe())
 	}
 
 	run()
-	if *once {
+	if cfg.once {
 		return
 	}
 
-	t := time.NewTicker(*interval)
+	t := time.NewTicker(cfg.interval)
 	defer t.Stop()
 	for {
 		select {

@@ -1,0 +1,16 @@
+[Unit]
+Description=clawtop daemon (multi-PC mode: pushes JSON to a remote viewer via SSH)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT BEFORE ENABLING: replace 'viewer-host' with your ssh_config alias.
+# Verify with: ssh viewer-host true
+ExecStart=%h/.local/bin/clawtopd --host=viewer-host --dir=/var/lib/clawtop --interval=60s
+Restart=on-failure
+RestartSec=10s
+# Reads ~/.claude/.credentials.json owned by this user; ssh-agent provides keys.
+
+[Install]
+WantedBy=default.target
