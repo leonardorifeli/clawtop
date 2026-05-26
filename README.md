@@ -1,8 +1,21 @@
-# clawtop
+<p align="center">
+  <img src="assets/logo.png" alt="clawtop" width="180" />
+</p>
 
-A dense TUI dashboard for your Anthropic Claude usage. Single PC or
-many. Built so the OAuth credentials never leave the machine that
-already holds them.
+<h1 align="center">clawtop</h1>
+
+<p align="center">
+  A dense TUI dashboard for your Anthropic Claude usage.<br />
+  Single PC or many. Credentials never leave the machine that already holds them.
+</p>
+
+<p align="center">
+  <a href="https://github.com/leonardorifeli/clawtop/releases/latest"><img src="https://img.shields.io/github/v/release/leonardorifeli/clawtop" alt="release" /></a>
+  <a href="https://github.com/leonardorifeli/clawtop/actions/workflows/ci.yml"><img src="https://github.com/leonardorifeli/clawtop/actions/workflows/ci.yml/badge.svg" alt="ci" /></a>
+  <a href="https://github.com/leonardorifeli/clawtop/blob/main/LICENSE"><img src="https://img.shields.io/github/license/leonardorifeli/clawtop" alt="license" /></a>
+</p>
+
+---
 
 ```
 clawtop · 19:23:04 · hosts 2 (omen,pop-os) · plan team · window 7d              fresh
