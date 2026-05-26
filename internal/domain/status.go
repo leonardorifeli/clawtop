@@ -51,7 +51,21 @@ type Status struct {
 	ByModel      []Model   `json:"by_model"`      // sorted desc by In+Out
 	Hourly24h    []int64   `json:"hourly_24h"`    // 24 buckets, oldest first, In+Out
 	Daily7d      []int64   `json:"daily_7d"`      // 7 buckets, oldest first, In+Out
+	TopSessions  []SessionStat `json:"top_sessions"` // top N most expensive sessions
 }
+
+// SessionStat summarizes a single Claude conversation worth of tokens.
+type SessionStat struct {
+	ID        string `json:"id"`
+	Project   string `json:"project"`    // basename of cwd
+	Model     string `json:"model"`      // dominant model id
+	In        int64  `json:"in"`
+	Out       int64  `json:"out"`
+	StartedAt int64  `json:"started_at"` // unix seconds of first usage event
+	LastAt    int64  `json:"last_at"`    // unix seconds of most recent usage event
+}
+
+func (s SessionStat) Total() int64 { return s.In + s.Out }
 
 func (s Status) Age() time.Duration {
 	return time.Since(time.Unix(s.TS, 0))

@@ -28,19 +28,21 @@ const (
 	tabProjects = 1
 	tabModels   = 2
 	tabHosts    = 3
-	tabHourly   = 4
-	tabCount    = 5
+	tabSessions = 4
+	tabHourly   = 5
+	tabCount    = 6
 )
 
-var tabNames = []string{"Limits", "Projects", "Models", "Hosts", "Hourly"}
+var tabNames = []string{"Limits", "Projects", "Models", "Hosts", "Sessions", "Hourly"}
 
 func main() {
 	var (
-		dir = flag.String("dir", "/var/lib/clawtop", "directory containing per-machine status JSON files")
+		dir     = flag.String("dir", "/var/lib/clawtop", "directory containing per-machine status JSON files")
+		machine = flag.String("machine", "", "show only this machine (filename without .json); empty = show all merged")
 	)
 	flag.Parse()
 
-	p := tea.NewProgram(initialModel(expandHome(*dir)), tea.WithAltScreen())
+	p := tea.NewProgram(initialModel(expandHome(*dir), *machine), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -68,19 +70,21 @@ type tickMsg time.Time
 
 type model struct {
 	dir             string
+	machineFilter   string // "" = all machines merged
+	availableHosts  []string
 	merged          merger.Merged
 	loadErr         error
 	count           int
 	tab             int
 	width           int
 	height          int
-	forceTabbed     bool // user toggled to tabbed even though dashboard would fit
-	forceDashboard  bool // user toggled to dashboard even though terminal is small
+	forceTabbed     bool
+	forceDashboard  bool
 	scrollProjects  int
 }
 
-func initialModel(dir string) model {
-	m := model{dir: dir}
+func initialModel(dir, filter string) model {
+	m := model{dir: dir, machineFilter: filter}
 	m.reload()
 	return m
 }
@@ -96,13 +100,48 @@ func (m *model) reload() {
 	m.count = n
 	m.loadErr = err
 	if err == nil {
-		m.merged = merger.Merge(parts)
+		m.availableHosts = m.availableHosts[:0]
+		for _, p := range parts {
+			m.availableHosts = append(m.availableHosts, p.Machine)
+		}
+		filtered := parts
+		if m.machineFilter != "" {
+			filtered = filtered[:0]
+			for _, p := range parts {
+				if p.Machine == m.machineFilter {
+					filtered = append(filtered, p)
+				}
+			}
+		}
+		m.merged = merger.Merge(filtered)
 	}
-	// Re-clamp scroll in case the project list shrank.
 	maxScroll := m.maxProjectScroll(m.projectsVisible())
 	if m.scrollProjects > maxScroll {
 		m.scrollProjects = maxScroll
 	}
+}
+
+// cycleFilter advances machineFilter through "", host1, host2, ..., back to "".
+func (m *model) cycleFilter() {
+	if len(m.availableHosts) <= 1 {
+		m.machineFilter = ""
+		return
+	}
+	if m.machineFilter == "" {
+		m.machineFilter = m.availableHosts[0]
+		return
+	}
+	for i, h := range m.availableHosts {
+		if h == m.machineFilter {
+			if i+1 < len(m.availableHosts) {
+				m.machineFilter = m.availableHosts[i+1]
+			} else {
+				m.machineFilter = ""
+			}
+			return
+		}
+	}
+	m.machineFilter = ""
 }
 
 // dashboardFits returns true when the terminal is big enough for the
@@ -164,6 +203,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.reload()
 			return m, nil
+		case "f":
+			m.cycleFilter()
+			m.reload()
+			return m, nil
 		case "t":
 			// Toggle layout mode and remember the user's intent.
 			if m.useDashboard() {
@@ -182,7 +225,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.tab = (m.tab + tabCount - 1) % tabCount
 			}
 			return m, nil
-		case "1", "2", "3", "4", "5":
+		case "1", "2", "3", "4", "5", "6":
 			if !m.useDashboard() {
 				m.tab = int(msg.String()[0] - '1')
 			}
@@ -266,7 +309,7 @@ func (m model) viewDashboard() string {
 	rule := dimStyle.Render(strings.Repeat("─", innerW))
 
 	// Compact status header in one line.
-	header := dashboardHeader(merged, innerW)
+	header := m.dashboardHeader(innerW)
 
 	// Limits: just two bars + reset, plan/limit goes into header line.
 	limits := dashboardLimits(merged, innerW)
@@ -289,9 +332,10 @@ func (m model) viewDashboard() string {
 	cols := lipgloss.JoinHorizontal(lipgloss.Top, leftCol, "  ", rightCol)
 
 	hosts := dashboardHosts(merged, innerW)
+	sessions := dashboardSessions(merged, innerW)
 	trends := dashboardTrends(merged, innerW)
 
-	keys := dimStyle.Render("t tabbed · j/k scroll · g/G top/end · r reload · q quit")
+	keys := dimStyle.Render("t tabbed · f filter host · j/k scroll · g/G top/end · r reload · q quit")
 
 	body := strings.Join([]string{
 		header,
@@ -302,21 +346,52 @@ func (m model) viewDashboard() string {
 		rule,
 		hosts,
 		rule,
+		sessions,
+		rule,
 		trends,
 		keys,
 	}, "\n")
 	return padding.Render(body)
 }
 
+// dashboardSessions is a compact 4-line view of the top 3 most expensive
+// sessions in the window.
+func dashboardSessions(m merger.Merged, w int) string {
+	header := labelStyle.Render("TOP SESSIONS")
+	if len(m.TopSessions) == 0 {
+		return header + " " + dimStyle.Render("none")
+	}
+	rows := []string{header}
+	now := time.Now()
+	for i, s := range m.TopSessions {
+		if i >= 3 {
+			break
+		}
+		age := now.Sub(time.Unix(s.LastAt, 0))
+		rows = append(rows, fmt.Sprintf("  %-22s %-12s %s · %s ago",
+			truncate(s.Project, 22),
+			pad(fmtTokens(s.Total()), 8),
+			dimStyle.Render(truncate(prettyModel(s.Model), 14)),
+			dimStyle.Render(short(age)),
+		))
+	}
+	return strings.Join(rows, "\n")
+}
+
 // dashboardHeader is a single status line: title, time, account-level KPIs,
-// hosts count, freshness. Saves several rows vs the v0.5 layout.
-func dashboardHeader(m merger.Merged, w int) string {
+// hosts count, optional filter, freshness.
+func (m model) dashboardHeader(w int) string {
+	merged := m.merged
+	filterPart := ""
+	if m.machineFilter != "" {
+		filterPart = "  ·  filter " + warnStyle.Render(m.machineFilter)
+	}
 	left := titleStyle.Render("clawtop") +
 		dimStyle.Render("  ·  "+time.Now().Format("15:04:05")+
-			"  ·  hosts "+fmt.Sprintf("%d (%s)", len(m.Machines), joinHosts(m.Machines))+
-			"  ·  plan "+fallback(m.Subscription, "?")+
-			"  ·  window "+fallback(m.Window, "?")+"  ")
-	right := freshnessLabel(m.Machines)
+			"  ·  hosts "+fmt.Sprintf("%d (%s)", len(merged.Machines), joinHosts(merged.Machines))+
+			"  ·  plan "+fallback(merged.Subscription, "?")+
+			"  ·  window "+fallback(merged.Window, "?")) + filterPart + dimStyle.Render("  ")
+	right := freshnessLabel(merged.Machines)
 	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
 		gap = 1
@@ -525,6 +600,8 @@ func (m model) viewTabbed() string {
 		body = viewModels(m.merged, innerW)
 	case tabHosts:
 		body = viewHosts(m.merged, innerW)
+	case tabSessions:
+		body = viewSessions(m.merged, innerW)
 	case tabHourly:
 		body = viewHourly(m.merged, innerW)
 	}
@@ -554,7 +631,7 @@ func footerLine(m merger.Merged, w int) string {
 	left := fmt.Sprintf("hosts: %d (%s)  window: %s  ",
 		len(m.Machines), joinHosts(m.Machines), fallback(m.Window, "?"))
 	staleness := freshnessLabel(m.Machines)
-	right := "tab/1-5 nav · t dash · r reload · q quit"
+	right := "tab/1-5 · t dash · f filter · r reload · q quit"
 	used := lipgloss.Width(left) + lipgloss.Width(staleness) + lipgloss.Width(right)
 	gap := w - used
 	if gap < 1 {
@@ -695,6 +772,32 @@ func viewHosts(m merger.Merged, w int) string {
 	return strings.Join(rows, "\n")
 }
 
+// viewSessions renders the top N most expensive sessions in the window.
+// Useful to spot runaway conversations and which project they belonged to.
+func viewSessions(m merger.Merged, w int) string {
+	header := labelStyle.Render(fmt.Sprintf("TOP SESSIONS (last %s)", fallback(m.Window, "?")))
+	if len(m.TopSessions) == 0 {
+		return strings.Join([]string{header, "", dimStyle.Render("no transcript data yet")}, "\n")
+	}
+	rows := []string{header, "",
+		dimStyle.Render(fmt.Sprintf("%-22s %-18s %-10s %-10s %s",
+			"project", "model", "tokens", "duration", "last seen")),
+	}
+	now := time.Now()
+	for _, s := range m.TopSessions {
+		dur := time.Duration(s.LastAt-s.StartedAt) * time.Second
+		age := now.Sub(time.Unix(s.LastAt, 0))
+		rows = append(rows, fmt.Sprintf("%-22s %-18s %-10s %-10s %s ago",
+			truncate(s.Project, 22),
+			truncate(prettyModel(s.Model), 18),
+			fmtTokens(s.Total()),
+			short(dur),
+			short(age),
+		))
+	}
+	return strings.Join(rows, "\n")
+}
+
 func viewHourly(m merger.Merged, w int) string {
 	header := labelStyle.Render("LAST 24h (tokens per hour, all machines combined)")
 	if len(m.Hourly24h) == 0 {
@@ -727,7 +830,7 @@ func barRanked(pct float64, width int) string {
 		color = lipgloss.Color("226")
 	}
 	return lipgloss.NewStyle().Foreground(color).Render(strings.Repeat("█", filled)) +
-		dimStyle.Render(strings.Repeat("░", rest))
+		dimStyle.Render(strings.Repeat("▒", rest))
 }
 
 // barNeutral is a single-color bar suitable for relative comparisons (project
@@ -735,7 +838,7 @@ func barRanked(pct float64, width int) string {
 func barNeutral(pct float64, width int) string {
 	filled, rest := barCells(pct, width)
 	return neutralBar.Render(strings.Repeat("█", filled)) +
-		dimStyle.Render(strings.Repeat("░", rest))
+		dimStyle.Render(strings.Repeat("▒", rest))
 }
 
 func barCells(pct float64, width int) (filled, rest int) {

@@ -18,11 +18,12 @@ type Merged struct {
 	Limit        string
 	Subscription string
 	Window       string
-	Sessions     int                // total distinct sessions, summed across machines
-	ByProject    []domain.Project   // sorted desc by In+Out
-	ByModel      []domain.Model     // sorted desc by In+Out
+	Sessions     int
+	ByProject    []domain.Project
+	ByModel      []domain.Model
 	Hourly24h    []int64
 	Daily7d      []int64
+	TopSessions  []domain.SessionStat // top N across all hosts
 
 	// HostsByProject[projectPath] -> list of (host, in, out) contributions,
 	// sorted by tokens desc. Populated only when more than one host
@@ -140,6 +141,16 @@ func Merge(parts []domain.Status) Merged {
 		for i := 0; i < 7 && i < len(p.Daily7d); i++ {
 			out.Daily7d[i] += p.Daily7d[i]
 		}
+		// Session IDs are unique per machine; union the lists then re-sort
+		// and cap at the end.
+		out.TopSessions = append(out.TopSessions, p.TopSessions...)
+	}
+
+	sort.Slice(out.TopSessions, func(i, j int) bool {
+		return out.TopSessions[i].Total() > out.TopSessions[j].Total()
+	})
+	if len(out.TopSessions) > 10 {
+		out.TopSessions = out.TopSessions[:10]
 	}
 
 	for _, v := range projects {

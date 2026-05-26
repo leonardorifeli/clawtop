@@ -29,11 +29,12 @@ type Options struct {
 }
 
 type Result struct {
-	ByProject []domain.Project
-	ByModel   []domain.Model
-	Hourly24h []int64
-	Daily7d   []int64
-	Sessions  int // distinct sessions on this machine in the window
+	ByProject   []domain.Project
+	ByModel     []domain.Model
+	Hourly24h   []int64
+	Daily7d     []int64
+	Sessions    int // distinct sessions on this machine in the window
+	TopSessions []domain.SessionStat
 }
 
 type entry struct {
@@ -70,11 +71,11 @@ func Collect(opts Options) (*Result, error) {
 	hourly := make([]int64, 24)
 	daily := make([]int64, 7)
 	sessionCWD := map[string]string{}
-	// Distinct session sets, scoped per (project, model) so the same
-	// conversation isn't double-counted across days.
 	projSessions := map[string]map[string]struct{}{}
 	modelSessions := map[string]map[string]struct{}{}
 	allSessions := map[string]struct{}{}
+	// Per-session aggregates for the "top sessions" panel.
+	sessAgg := map[string]*domain.SessionStat{}
 
 	err := filepath.WalkDir(opts.Root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -140,12 +141,12 @@ func Collect(opts Options) (*Result, error) {
 				held = append(held, p)
 				continue
 			}
-			apply(projects, models, hourly, daily, projSessions, modelSessions, allSessions,
+			apply(projects, models, hourly, daily, projSessions, modelSessions, allSessions, sessAgg,
 				dayAgo, weekAgo, p, cwd)
 		}
 		for _, p := range held {
 			cwd := sessionCWD[p.session]
-			apply(projects, models, hourly, daily, projSessions, modelSessions, allSessions,
+			apply(projects, models, hourly, daily, projSessions, modelSessions, allSessions, sessAgg,
 				dayAgo, weekAgo, p, cwd)
 		}
 		return nil
@@ -154,7 +155,6 @@ func Collect(opts Options) (*Result, error) {
 		return nil, err
 	}
 
-	// Stamp final session counts into the project / model structs.
 	for path, pj := range projects {
 		pj.Sessions = len(projSessions[path])
 	}
@@ -163,11 +163,12 @@ func Collect(opts Options) (*Result, error) {
 	}
 
 	return &Result{
-		ByProject: sortProjects(projects),
-		ByModel:   sortModels(models),
-		Hourly24h: hourly,
-		Daily7d:   daily,
-		Sessions:  len(allSessions),
+		ByProject:   sortProjects(projects),
+		ByModel:     sortModels(models),
+		Hourly24h:   hourly,
+		Daily7d:     daily,
+		Sessions:    len(allSessions),
+		TopSessions: topSessions(sessAgg, 10),
 	}, nil
 }
 
@@ -179,6 +180,7 @@ func apply(
 	projSessions map[string]map[string]struct{},
 	modelSessions map[string]map[string]struct{},
 	allSessions map[string]struct{},
+	sessAgg map[string]*domain.SessionStat,
 	dayAgo, weekAgo time.Time,
 	p struct {
 		session string
@@ -228,6 +230,26 @@ func apply(
 			}
 			modelSessions[p.model][p.session] = struct{}{}
 		}
+		ts := p.ts.Unix()
+		sa, ok := sessAgg[p.session]
+		if !ok {
+			sa = &domain.SessionStat{
+				ID:        p.session,
+				Project:   basename(key),
+				Model:     p.model,
+				StartedAt: ts,
+				LastAt:    ts,
+			}
+			sessAgg[p.session] = sa
+		}
+		sa.In += p.in
+		sa.Out += p.out
+		if ts < sa.StartedAt {
+			sa.StartedAt = ts
+		}
+		if ts > sa.LastAt {
+			sa.LastAt = ts
+		}
 	}
 
 	tokens := p.in + p.out
@@ -270,6 +292,18 @@ func sortProjects(m map[string]*domain.Project) []domain.Project {
 		out = append(out, *v)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Total() > out[j].Total() })
+	return out
+}
+
+func topSessions(m map[string]*domain.SessionStat, n int) []domain.SessionStat {
+	out := make([]domain.SessionStat, 0, len(m))
+	for _, v := range m {
+		out = append(out, *v)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Total() > out[j].Total() })
+	if len(out) > n {
+		out = out[:n]
+	}
 	return out
 }
 
