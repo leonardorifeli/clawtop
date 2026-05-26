@@ -83,10 +83,41 @@ install_bin() {
   info "Installed $dst"
 }
 
+# install_unit copies a systemd user unit from the extracted tarball into
+# ~/.config/systemd/user. If a file with the same name already exists and
+# differs, the new one is dropped as .new so user edits are preserved.
+install_unit() {
+  src="$TMP/deploy/$1"
+  unit_dir="$HOME/.config/systemd/user"
+  dst="$unit_dir/$1"
+  [ -f "$src" ] || return 0
+  mkdir -p "$unit_dir"
+  if [ -f "$dst" ] && ! cmp -s "$src" "$dst"; then
+    install -m 0644 "$src" "$dst.new"
+    info "Installed $dst.new (existing differs; review and replace if desired)"
+  else
+    install -m 0644 "$src" "$dst"
+    info "Installed $dst"
+  fi
+}
+
 case "$WHAT" in
-  daemon) install_bin clawtopd ;;
-  viewer) install_bin clawtop ;;
-  both)   install_bin clawtopd; install_bin clawtop ;;
+  daemon)
+    install_bin clawtopd
+    install_unit clawtopd-local.service
+    install_unit clawtopd-remote.service
+    ;;
+  viewer)
+    install_bin clawtop
+    install_unit clawtop.service
+    ;;
+  both)
+    install_bin clawtopd
+    install_bin clawtop
+    install_unit clawtopd-local.service
+    install_unit clawtopd-remote.service
+    install_unit clawtop.service
+    ;;
 esac
 
 case ":$PATH:" in
@@ -97,7 +128,9 @@ esac
 cat <<EOF
 
 Next steps:
-  clawtopd doctor                                     # verify setup
-  https://github.com/$REPO#quickstart                 # single-PC or multi-PC walkthrough
+  clawtopd doctor                                     # verify credentials, anthropic, destination
+  systemctl --user daemon-reload
+  systemctl --user enable --now clawtopd-local        # single-PC; for multi-PC use clawtopd-remote
+  https://github.com/$REPO#quickstart                 # full walkthrough
 
 EOF

@@ -21,6 +21,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -105,10 +106,31 @@ func parseRunFlags(args []string) *runConfig {
 			cfg.dir = "/var/lib/clawtop"
 		}
 	}
+	cfg.dir = expandHome(cfg.dir)
+	cfg.credsPath = expandHome(cfg.credsPath)
+	cfg.projectsRoot = expandHome(cfg.projectsRoot)
 	if cfg.machineID == "" {
 		log.Fatal("--machine required when hostname is empty")
 	}
 	return cfg
+}
+
+// expandHome resolves a leading "~" or "~/" to the current user's home
+// directory. Shells do not tilde-expand the value side of --flag=value
+// arguments, so users writing `--dir=~/foo` would otherwise get a literal
+// tilde as the path.
+func expandHome(p string) string {
+	if p == "~" {
+		if h, err := os.UserHomeDir(); err == nil {
+			return h
+		}
+	}
+	if strings.HasPrefix(p, "~/") {
+		if h, err := os.UserHomeDir(); err == nil {
+			return h + p[1:]
+		}
+	}
+	return p
 }
 
 // newPusher returns the appropriate Pusher for the configured host.
@@ -129,6 +151,11 @@ func runDaemon(args []string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Last successful probe is held across polls so a transient Anthropic
+	// failure (rate-limit, network blip) does not blank the dashboard.
+	// Transcript aggregation always runs from fresh, since it is local I/O.
+	var lastProbed *domain.Status
+
 	run := func() {
 		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
@@ -143,12 +170,19 @@ func runDaemon(args []string) {
 		if !cfg.skipProbe {
 			probed, err := client.Probe(probeCtx)
 			if err != nil {
-				log.Printf("probe: %v", err)
+				log.Printf("probe: %v (keeping last-known-good)", err)
+				if lastProbed != nil {
+					s.Session = lastProbed.Session
+					s.Week = lastProbed.Week
+					s.Limit = lastProbed.Limit
+					s.Subscription = lastProbed.Subscription
+				}
 			} else {
 				s.Session = probed.Session
 				s.Week = probed.Week
 				s.Limit = probed.Limit
 				s.Subscription = probed.Subscription
+				lastProbed = probed
 			}
 		}
 

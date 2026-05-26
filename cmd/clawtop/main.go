@@ -39,11 +39,30 @@ func main() {
 	)
 	flag.Parse()
 
-	p := tea.NewProgram(initialModel(*dir), tea.WithAltScreen())
+	p := tea.NewProgram(initialModel(expandHome(*dir)), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// expandHome resolves a leading "~" or "~/" to the current user's home
+// directory. Needed because shells (bash, zsh) do not tilde-expand the
+// value side of --flag=value arguments, so users writing
+// `clawtop --dir=~/.local/share/clawtop` would otherwise get the literal
+// tilde as the path.
+func expandHome(p string) string {
+	if p == "~" {
+		if h, err := os.UserHomeDir(); err == nil {
+			return h
+		}
+	}
+	if strings.HasPrefix(p, "~/") {
+		if h, err := os.UserHomeDir(); err == nil {
+			return h + p[1:]
+		}
+	}
+	return p
 }
 
 type tickMsg time.Time
@@ -201,10 +220,17 @@ func footerLine(m merger.Merged, w int) string {
 	case oldest > 2*time.Minute:
 		staleness = warnStyle.Render("stale " + short(oldest))
 	}
-	left := fmt.Sprintf("hosts: %d (%s)  window: %s  %s",
-		len(m.Machines), strings.Join(hosts, ","), fallback(m.Window, "?"), staleness)
+	left := fmt.Sprintf("hosts: %d (%s)  window: %s  ",
+		len(m.Machines), strings.Join(hosts, ","), fallback(m.Window, "?"))
 	right := "tab/← → switch · 1-4 jump · r reload · q quit"
-	return dimStyle.Render(padRight(left, w-lipgloss.Width(right)) + right)
+	// Pad using lipgloss.Width so ANSI escapes in `staleness` don't throw
+	// off the alignment.
+	used := lipgloss.Width(left) + lipgloss.Width(staleness) + lipgloss.Width(right)
+	gap := w - used
+	if gap < 1 {
+		gap = 1
+	}
+	return dimStyle.Render(left) + staleness + strings.Repeat(" ", gap) + dimStyle.Render(right)
 }
 
 // ---- tab: limits ----------------------------------------------------------

@@ -19,7 +19,7 @@ const (
 	apiVersion  = "2023-06-01"
 	oauthBeta   = "oauth-2025-04-20"
 	probeModel  = "claude-haiku-4-5"
-	defaultUA   = "clawtop/0.3 (+https://github.com/leonardorifeli/clawtop)"
+	defaultUA   = "clawtop/0.3.1 (+https://github.com/leonardorifeli/clawtop)"
 	httpTimeout = 30 * time.Second
 )
 
