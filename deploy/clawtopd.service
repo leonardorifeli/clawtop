@@ -1,0 +1,15 @@
+[Unit]
+Description=clawtop daemon (polls Anthropic, pushes status to remote host)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/clawtopd --host=clawtop-viewer --remote-dir=/var/lib/clawtop --interval=60s
+Restart=on-failure
+RestartSec=10s
+# The daemon reads ~/.claude/.credentials.json; running as the logged-in user
+# keeps the OAuth token scoped to that user account.
+
+[Install]
+WantedBy=default.target

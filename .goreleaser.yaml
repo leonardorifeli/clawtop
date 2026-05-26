@@ -1,0 +1,98 @@
+version: 2
+
+project_name: clawtop
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: clawtopd
+    main: ./cmd/clawtopd
+    binary: clawtopd
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}}
+
+  - id: clawtop
+    main: ./cmd/clawtop
+    binary: clawtop
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}}
+
+archives:
+  - id: default
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+      - deploy/*.service
+      - deploy/INSTALL.md
+
+nfpms:
+  - id: packages
+    package_name: clawtop
+    vendor: rifeli
+    homepage: https://github.com/leonardorifeli/clawtop
+    maintainer: Leonardo Rifeli <leo@rifeli.dev>
+    description: |-
+      Multi-host TUI dashboard for Anthropic Claude usage. A daemon polls
+      Anthropic and aggregates local transcripts; a TUI viewer renders the
+      merged result from one or more machines.
+    license: MIT
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    contents:
+      - src: deploy/clawtopd.service
+        dst: /usr/lib/systemd/user/clawtopd.service
+      - src: deploy/clawtop.service
+        dst: /usr/lib/systemd/user/clawtop.service
+      - src: README.md
+        dst: /usr/share/doc/clawtop/README.md
+      - src: deploy/INSTALL.md
+        dst: /usr/share/doc/clawtop/INSTALL.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\(.+\))??:.+$'
+      order: 1
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+
+release:
+  draft: false
+  prerelease: auto
+  header: |
+    ## clawtop {{ .Version }}
+
+    Multi-host TUI dashboard for Anthropic Claude usage. See [README](https://github.com/leonardorifeli/clawtop) for the install walkthrough.
+  footer: |
+    **Quick install**
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/leonardorifeli/clawtop/main/install.sh | sh
+    ```
