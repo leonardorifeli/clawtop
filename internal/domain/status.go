@@ -7,7 +7,7 @@ package domain
 import "time"
 
 // Schema version. Bump when making a breaking change.
-const Version = 2
+const Version = 3
 
 // Window represents a rate-limit window (e.g. 5h session or 7d weekly).
 type Window struct {
@@ -17,21 +17,23 @@ type Window struct {
 
 // Project aggregates token usage attributed to a working directory.
 type Project struct {
-	Name   string `json:"name"` // basename of Path
-	Path   string `json:"path"` // canonical absolute path (from transcript cwd)
-	In     int64  `json:"in"`
-	Out    int64  `json:"out"`
-	CacheR int64  `json:"cache_read"`
-	CacheC int64  `json:"cache_create"`
+	Name     string `json:"name"`           // basename of Path
+	Path     string `json:"path"`           // canonical absolute path (from transcript cwd)
+	In       int64  `json:"in"`
+	Out      int64  `json:"out"`
+	CacheR   int64  `json:"cache_read"`
+	CacheC   int64  `json:"cache_create"`
+	Sessions int    `json:"sessions"`       // distinct conversation count in the window
 }
 
 // Model aggregates token usage by model id (e.g. claude-opus-4-7).
 type Model struct {
-	Model  string `json:"model"`
-	In     int64  `json:"in"`
-	Out    int64  `json:"out"`
-	CacheR int64  `json:"cache_read"`
-	CacheC int64  `json:"cache_create"`
+	Model    string `json:"model"`
+	In       int64  `json:"in"`
+	Out      int64  `json:"out"`
+	CacheR   int64  `json:"cache_read"`
+	CacheC   int64  `json:"cache_create"`
+	Sessions int    `json:"sessions"`
 }
 
 // Status is the full payload emitted per machine per poll.
@@ -43,10 +45,12 @@ type Status struct {
 	Week         Window    `json:"week"`
 	Limit        string    `json:"limit"`
 	Subscription string    `json:"subscription"`
-	Window       string    `json:"window"`      // aggregation lookback ("7d", "30d")
-	ByProject    []Project `json:"by_project"`  // sorted desc by In+Out
-	ByModel      []Model   `json:"by_model"`    // sorted desc by In+Out
-	Hourly24h    []int64   `json:"hourly_24h"`  // 24 buckets, oldest first, In+Out
+	Window       string    `json:"window"`        // aggregation lookback ("7d", "30d")
+	Sessions     int       `json:"sessions"`      // distinct sessions seen on this machine
+	ByProject    []Project `json:"by_project"`    // sorted desc by In+Out
+	ByModel      []Model   `json:"by_model"`      // sorted desc by In+Out
+	Hourly24h    []int64   `json:"hourly_24h"`    // 24 buckets, oldest first, In+Out
+	Daily7d      []int64   `json:"daily_7d"`      // 7 buckets, oldest first, In+Out
 }
 
 func (s Status) Age() time.Duration {
@@ -66,3 +70,13 @@ func (w Window) ResetIn() time.Duration {
 
 func (p Project) Total() int64 { return p.In + p.Out }
 func (m Model) Total() int64   { return m.In + m.Out }
+
+// CacheHitRate returns the fraction of input tokens served from cache for
+// this model, as a value in [0, 100]. Zero when no input tokens at all.
+func (m Model) CacheHitRate() float64 {
+	denom := m.In + m.CacheR
+	if denom == 0 {
+		return 0
+	}
+	return float64(m.CacheR) / float64(denom) * 100
+}

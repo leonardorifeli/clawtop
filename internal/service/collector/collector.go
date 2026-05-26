@@ -1,6 +1,7 @@
 // Package collector reads Claude Code transcript JSONL files from
 // ~/.claude/projects/<encoded-path>/<session-uuid>.jsonl and aggregates
-// per-project, per-model, and hourly token usage.
+// per-project, per-model, hourly, and daily token usage, plus distinct
+// session counts.
 //
 // Each session has an authoritative working directory recorded in user/
 // attachment events as the "cwd" field; we use that as the canonical project
@@ -31,6 +32,8 @@ type Result struct {
 	ByProject []domain.Project
 	ByModel   []domain.Model
 	Hourly24h []int64
+	Daily7d   []int64
+	Sessions  int // distinct sessions on this machine in the window
 }
 
 type entry struct {
@@ -39,10 +42,10 @@ type entry struct {
 	Message struct {
 		Model string `json:"model"`
 		Usage struct {
-			Input               int64 `json:"input_tokens"`
-			Output              int64 `json:"output_tokens"`
-			CacheCreationInput  int64 `json:"cache_creation_input_tokens"`
-			CacheReadInput      int64 `json:"cache_read_input_tokens"`
+			Input              int64 `json:"input_tokens"`
+			Output             int64 `json:"output_tokens"`
+			CacheCreationInput int64 `json:"cache_creation_input_tokens"`
+			CacheReadInput     int64 `json:"cache_read_input_tokens"`
 		} `json:"usage"`
 	} `json:"message"`
 	SessionID string `json:"sessionId"`
@@ -50,8 +53,7 @@ type entry struct {
 }
 
 // Collect walks Opts.Root, parses every .jsonl file, and aggregates usage
-// within the lookback window. Returns empty slices (not nil) on missing data
-// so the consumer can rely on len() semantics.
+// within the lookback window.
 func Collect(opts Options) (*Result, error) {
 	if opts.Now.IsZero() {
 		opts.Now = time.Now()
@@ -61,16 +63,22 @@ func Collect(opts Options) (*Result, error) {
 	}
 	cutoff := opts.Now.Add(-opts.Window)
 	dayAgo := opts.Now.Add(-24 * time.Hour)
+	weekAgo := opts.Now.Add(-7 * 24 * time.Hour)
 
 	projects := map[string]*domain.Project{}
 	models := map[string]*domain.Model{}
 	hourly := make([]int64, 24)
-	// Session -> canonical cwd (from first message that has it).
+	daily := make([]int64, 7)
 	sessionCWD := map[string]string{}
+	// Distinct session sets, scoped per (project, model) so the same
+	// conversation isn't double-counted across days.
+	projSessions := map[string]map[string]struct{}{}
+	modelSessions := map[string]map[string]struct{}{}
+	allSessions := map[string]struct{}{}
 
 	err := filepath.WalkDir(opts.Root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil // skip unreadable subtrees rather than aborting
+			return nil
 		}
 		if d.IsDir() || !strings.HasSuffix(path, ".jsonl") {
 			return nil
@@ -81,11 +89,6 @@ func Collect(opts Options) (*Result, error) {
 		}
 		defer f.Close()
 
-		// First pass on this file: scan for the cwd of each session.
-		// We do a single pass and resolve cwd on the fly: if a usage entry
-		// arrives before any cwd in the same file, we hold it until cwd is
-		// known. In practice the first user message (with cwd) appears
-		// before any assistant usage, so the held set stays empty.
 		type pending struct {
 			session string
 			model   string
@@ -137,12 +140,13 @@ func Collect(opts Options) (*Result, error) {
 				held = append(held, p)
 				continue
 			}
-			apply(projects, models, hourly, dayAgo, p, cwd)
+			apply(projects, models, hourly, daily, projSessions, modelSessions, allSessions,
+				dayAgo, weekAgo, p, cwd)
 		}
-		// Drain held entries now that we've seen all cwd announcements in the file.
 		for _, p := range held {
 			cwd := sessionCWD[p.session]
-			apply(projects, models, hourly, dayAgo, p, cwd)
+			apply(projects, models, hourly, daily, projSessions, modelSessions, allSessions,
+				dayAgo, weekAgo, p, cwd)
 		}
 		return nil
 	})
@@ -150,10 +154,20 @@ func Collect(opts Options) (*Result, error) {
 		return nil, err
 	}
 
+	// Stamp final session counts into the project / model structs.
+	for path, pj := range projects {
+		pj.Sessions = len(projSessions[path])
+	}
+	for id, m := range models {
+		m.Sessions = len(modelSessions[id])
+	}
+
 	return &Result{
 		ByProject: sortProjects(projects),
 		ByModel:   sortModels(models),
 		Hourly24h: hourly,
+		Daily7d:   daily,
+		Sessions:  len(allSessions),
 	}, nil
 }
 
@@ -161,7 +175,11 @@ func apply(
 	projects map[string]*domain.Project,
 	models map[string]*domain.Model,
 	hourly []int64,
-	dayAgo time.Time,
+	daily []int64,
+	projSessions map[string]map[string]struct{},
+	modelSessions map[string]map[string]struct{},
+	allSessions map[string]struct{},
+	dayAgo, weekAgo time.Time,
 	p struct {
 		session string
 		model   string
@@ -172,7 +190,6 @@ func apply(
 	},
 	cwd string,
 ) {
-	// Project bucket — key on full path, displayed as basename.
 	key := cwd
 	if key == "" {
 		key = "(unknown)"
@@ -187,7 +204,6 @@ func apply(
 	pj.CacheR += p.cacheR
 	pj.CacheC += p.cacheC
 
-	// Model bucket.
 	if p.model != "" {
 		m, ok := models[p.model]
 		if !ok {
@@ -200,7 +216,21 @@ func apply(
 		m.CacheC += p.cacheC
 	}
 
-	// Hourly bucket — last 24h, oldest first.
+	if p.session != "" {
+		allSessions[p.session] = struct{}{}
+		if projSessions[key] == nil {
+			projSessions[key] = map[string]struct{}{}
+		}
+		projSessions[key][p.session] = struct{}{}
+		if p.model != "" {
+			if modelSessions[p.model] == nil {
+				modelSessions[p.model] = map[string]struct{}{}
+			}
+			modelSessions[p.model][p.session] = struct{}{}
+		}
+	}
+
+	tokens := p.in + p.out
 	if p.ts.After(dayAgo) {
 		idx := 23 - int(time.Since(p.ts)/time.Hour)
 		if idx < 0 {
@@ -209,7 +239,18 @@ func apply(
 		if idx > 23 {
 			idx = 23
 		}
-		hourly[idx] += p.in + p.out
+		hourly[idx] += tokens
+	}
+	if p.ts.After(weekAgo) {
+		// Daily bucket: 6 = most recent day (today), 0 = 6 days ago.
+		idx := 6 - int(time.Since(p.ts)/(24*time.Hour))
+		if idx < 0 {
+			idx = 0
+		}
+		if idx > 6 {
+			idx = 6
+		}
+		daily[idx] += tokens
 	}
 }
 

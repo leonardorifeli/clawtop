@@ -27,11 +27,12 @@ const (
 	tabLimits   = 0
 	tabProjects = 1
 	tabModels   = 2
-	tabHourly   = 3
-	tabCount    = 4
+	tabHosts    = 3
+	tabHourly   = 4
+	tabCount    = 5
 )
 
-var tabNames = []string{"Limits", "Projects", "Models", "Hourly"}
+var tabNames = []string{"Limits", "Projects", "Models", "Hosts", "Hourly"}
 
 func main() {
 	var (
@@ -177,7 +178,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.tab = (m.tab + tabCount - 1) % tabCount
 			}
 			return m, nil
-		case "1", "2", "3", "4":
+		case "1", "2", "3", "4", "5":
 			if !m.useDashboard() {
 				m.tab = int(msg.String()[0] - '1')
 			}
@@ -287,6 +288,7 @@ func (m model) viewDashboard() string {
 	rightCol := dashboardModels(merged, rightW)
 	cols := lipgloss.JoinHorizontal(lipgloss.Top, leftCol, "  ", rightCol)
 
+	hosts := dashboardHosts(merged, innerW)
 	hourly := dashboardHourly(merged, innerW)
 
 	keys := dimStyle.Render("q quit · r reload · t tabbed · j/k g G PgUp/PgDn scroll projects")
@@ -298,11 +300,56 @@ func (m model) viewDashboard() string {
 		"",
 		cols,
 		"",
+		hosts,
+		"",
 		hourly,
 		"",
 		keys,
 	}, "\n")
 	return padding.Render(body)
+}
+
+// dashboardHosts renders a single-line summary per machine. Stays compact
+// because each line is one row.
+func dashboardHosts(m merger.Merged, w int) string {
+	header := labelStyle.Render("HOSTS")
+	if len(m.Machines) == 0 {
+		return header
+	}
+	now := time.Now()
+	rows := []string{header}
+	for _, mi := range m.Machines {
+		age := now.Sub(time.Unix(mi.TS, 0))
+		fresh := okStyle.Render("fresh")
+		switch {
+		case age > 5*time.Minute:
+			fresh = errStyle.Render(short(age))
+		case age > 2*time.Minute:
+			fresh = warnStyle.Render(short(age))
+		}
+		rows = append(rows, fmt.Sprintf("  %-16s %s tokens · %d projects · %d sessions · %s",
+			truncate(mi.Name, 16),
+			pad(fmtTokens(mi.Total), 7),
+			mi.Projects,
+			mi.Sessions,
+			fresh,
+		))
+	}
+	return strings.Join(rows, "\n")
+}
+
+// hostsLine renders a compact per-host attribution line like
+// "omen 800k · laptop 100k". Truncated to fit w.
+func hostsLine(hosts []merger.HostContribution, w int) string {
+	parts := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		parts = append(parts, fmt.Sprintf("%s %s", h.Host, fmtTokens(h.Total())))
+	}
+	s := strings.Join(parts, " · ")
+	if len(s) > w {
+		s = s[:w-1] + "…"
+	}
+	return s
 }
 
 func dashboardLimits(m merger.Merged, w int) string {
@@ -363,6 +410,12 @@ func dashboardProjects(m merger.Merged, w, visible, scroll int) string {
 			pad(fmtTokens(p.Total()), numW),
 			barNeutral(ratio, barW),
 		))
+		// Host attribution sub-line only when 2+ hosts contributed.
+		if hosts, ok := m.HostsByProject[p.Path]; ok {
+			rows = append(rows, dimStyle.Render("  "+hostsLine(hosts, w-2)))
+		} else if p.Sessions > 0 {
+			rows = append(rows, dimStyle.Render(fmt.Sprintf("  %d sessions", p.Sessions)))
+		}
 	}
 
 	hint := ""
@@ -389,10 +442,10 @@ func dashboardModels(m merger.Merged, w int) string {
 		rows = append(rows,
 			fmt.Sprintf("%-*s %s", w-10, truncate(prettyModel(mm.Model), w-10),
 				pad(fmtTokens(mm.Total()), 9)),
-			dimStyle.Render(fmt.Sprintf("  in=%s  out=%s",
-				fmtTokens(mm.In), fmtTokens(mm.Out))),
-			dimStyle.Render(fmt.Sprintf("  cache_read=%s  cache_create=%s",
-				fmtTokens(mm.CacheR), fmtTokens(mm.CacheC))),
+			dimStyle.Render(fmt.Sprintf("  in=%s  out=%s  cache_hit=%.0f%%",
+				fmtTokens(mm.In), fmtTokens(mm.Out), mm.CacheHitRate())),
+			dimStyle.Render(fmt.Sprintf("  cache_read=%s  cache_create=%s  sessions=%d",
+				fmtTokens(mm.CacheR), fmtTokens(mm.CacheC), mm.Sessions)),
 			"",
 		)
 	}
@@ -438,6 +491,8 @@ func (m model) viewTabbed() string {
 		body = viewProjects(m.merged, innerW, m.projectsVisible(), m.scrollProjects)
 	case tabModels:
 		body = viewModels(m.merged, innerW)
+	case tabHosts:
+		body = viewHosts(m.merged, innerW)
 	case tabHourly:
 		body = viewHourly(m.merged, innerW)
 	}
@@ -467,7 +522,7 @@ func footerLine(m merger.Merged, w int) string {
 	left := fmt.Sprintf("hosts: %d (%s)  window: %s  ",
 		len(m.Machines), joinHosts(m.Machines), fallback(m.Window, "?"))
 	staleness := freshnessLabel(m.Machines)
-	right := "tab/← → switch · 1-4 jump · t dash · r reload · q quit"
+	right := "tab/1-5 nav · t dash · r reload · q quit"
 	used := lipgloss.Width(left) + lipgloss.Width(staleness) + lipgloss.Width(right)
 	gap := w - used
 	if gap < 1 {
@@ -524,6 +579,11 @@ func viewProjects(m merger.Merged, w, visible, scroll int) string {
 			barNeutral(ratio, barW),
 			pad(fmtTokens(p.Total()), numW),
 		))
+		if hosts, ok := m.HostsByProject[p.Path]; ok {
+			rows = append(rows, dimStyle.Render("  "+hostsLine(hosts, w-2)))
+		} else if p.Sessions > 0 {
+			rows = append(rows, dimStyle.Render(fmt.Sprintf("  %d sessions", p.Sessions)))
+		}
 	}
 	if scroll > 0 || end < len(m.ByProject) {
 		rows = append(rows, dimStyle.Render(fmt.Sprintf("showing %d-%d of %d · j/k g G PgUp/PgDn",
@@ -564,7 +624,41 @@ func viewModels(m merger.Merged, w int) string {
 				nameW, "",
 				fmtTokens(mm.In), fmtTokens(mm.Out),
 				fmtTokens(mm.CacheR), fmtTokens(mm.CacheC))),
+			dimStyle.Render(fmt.Sprintf("%-*s  cache_hit=%.0f%%  sessions=%d",
+				nameW, "", mm.CacheHitRate(), mm.Sessions)),
 		)
+	}
+	return strings.Join(rows, "\n")
+}
+
+// viewHosts renders the per-machine table: name, freshness, total tokens
+// contributed, distinct projects, distinct sessions. Useful to spot who is
+// doing the heavy lifting and who has gone quiet.
+func viewHosts(m merger.Merged, w int) string {
+	header := labelStyle.Render(fmt.Sprintf("HOSTS (last %s)", fallback(m.Window, "?")))
+	if len(m.Machines) == 0 {
+		return strings.Join([]string{header, "", dimStyle.Render("no hosts reporting")}, "\n")
+	}
+	now := time.Now()
+	rows := []string{header, "",
+		dimStyle.Render(fmt.Sprintf("%-18s %-10s %-10s %-10s %s", "name", "tokens", "projects", "sessions", "freshness")),
+	}
+	for _, mi := range m.Machines {
+		age := now.Sub(time.Unix(mi.TS, 0))
+		fresh := okStyle.Render("fresh")
+		switch {
+		case age > 5*time.Minute:
+			fresh = errStyle.Render(short(age))
+		case age > 2*time.Minute:
+			fresh = warnStyle.Render(short(age))
+		}
+		rows = append(rows, fmt.Sprintf("%-18s %-10s %-10d %-10d %s",
+			truncate(mi.Name, 18),
+			fmtTokens(mi.Total),
+			mi.Projects,
+			mi.Sessions,
+			fresh,
+		))
 	}
 	return strings.Join(rows, "\n")
 }

@@ -196,6 +196,8 @@ func runDaemon(args []string) {
 			s.ByProject = capProjects(agg.ByProject, 20)
 			s.ByModel = agg.ByModel
 			s.Hourly24h = agg.Hourly24h
+			s.Daily7d = agg.Daily7d
+			s.Sessions = agg.Sessions
 		}
 
 		payload, _ := json.Marshal(s)
