@@ -106,9 +106,11 @@ func (m *model) reload() {
 }
 
 // dashboardFits returns true when the terminal is big enough for the
-// single-screen layout.
+// single-screen layout. The threshold is intentionally loose: tighter than
+// this, the dashboard would overflow vertically and dropping back to the
+// tabbed layout gives a cleaner read.
 func (m model) dashboardFits() bool {
-	return m.width >= 100 && m.height >= 22
+	return m.width >= 80 && m.height >= 18
 }
 
 func (m model) useDashboard() bool {
@@ -122,20 +124,22 @@ func (m model) useDashboard() bool {
 }
 
 // projectsVisible returns how many project rows fit in the current layout.
+// Each project may add a sub-line (sessions or host attribution), so we
+// account for the worst case to avoid overflow.
 func (m model) projectsVisible() int {
 	if m.useDashboard() {
-		// Dashboard reserves space for limits (4), models column (5+),
-		// sparkline (4), header (1), and footer (2).
-		n := m.height - 16
-		if n < 3 {
-			return 3
+		// Dashboard reserves: header (1), limits (2), 2 rules, hosts (2-4),
+		// hourly+daily (2), help (1), plus blank lines between sections.
+		// Each project line takes 2 rows (name+sub-line).
+		n := (m.height - 14) / 2
+		if n < 2 {
+			return 2
 		}
 		return n
 	}
-	// Tabbed projects view uses (height - header - footer - spacing).
-	n := m.height - 6
-	if n < 5 {
-		return 5
+	n := (m.height - 6) / 2
+	if n < 3 {
+		return 3
 	}
 	return n
 }
@@ -259,28 +263,24 @@ func (m model) viewDashboard() string {
 	innerW := w - 2 // padding(1, 1)
 
 	merged := m.merged
+	rule := dimStyle.Render(strings.Repeat("─", innerW))
 
-	// Header line: title + hosts + window + freshness.
-	staleness := freshnessLabel(merged.Machines)
-	hostsLabel := fmt.Sprintf("hosts: %d (%s)", len(merged.Machines), joinHosts(merged.Machines))
-	header := titleStyle.Render("clawtop") +
-		dimStyle.Render("  ·  "+time.Now().Format("15:04:05")+"  ·  "+hostsLabel+
-			"  window: "+fallback(merged.Window, "?")+"  ") + staleness
+	// Compact status header in one line.
+	header := dashboardHeader(merged, innerW)
 
-	// Limits section: two compact bars side by side or stacked.
-	limitsW := innerW
-	limits := dashboardLimits(merged, limitsW)
+	// Limits: just two bars + reset, plan/limit goes into header line.
+	limits := dashboardLimits(merged, innerW)
 
 	// Projects + Models side by side.
 	leftW := innerW * 60 / 100
-	rightW := innerW - leftW - 2 // 2 for gap
-	if leftW < 40 {
-		leftW = 40
+	rightW := innerW - leftW - 2
+	if leftW < 38 {
+		leftW = 38
 	}
-	if rightW < 25 {
+	if rightW < 24 {
 		rightW = innerW - leftW - 2
-		if rightW < 25 {
-			rightW = 25
+		if rightW < 24 {
+			rightW = 24
 		}
 	}
 	visible := m.projectsVisible()
@@ -289,35 +289,49 @@ func (m model) viewDashboard() string {
 	cols := lipgloss.JoinHorizontal(lipgloss.Top, leftCol, "  ", rightCol)
 
 	hosts := dashboardHosts(merged, innerW)
-	hourly := dashboardHourly(merged, innerW)
+	trends := dashboardTrends(merged, innerW)
 
-	keys := dimStyle.Render("q quit · r reload · t tabbed · j/k g G PgUp/PgDn scroll projects")
+	keys := dimStyle.Render("t tabbed · j/k scroll · g/G top/end · r reload · q quit")
 
 	body := strings.Join([]string{
 		header,
-		"",
+		rule,
 		limits,
-		"",
+		rule,
 		cols,
-		"",
+		rule,
 		hosts,
-		"",
-		hourly,
-		"",
+		rule,
+		trends,
 		keys,
 	}, "\n")
 	return padding.Render(body)
 }
 
-// dashboardHosts renders a single-line summary per machine. Stays compact
-// because each line is one row.
+// dashboardHeader is a single status line: title, time, account-level KPIs,
+// hosts count, freshness. Saves several rows vs the v0.5 layout.
+func dashboardHeader(m merger.Merged, w int) string {
+	left := titleStyle.Render("clawtop") +
+		dimStyle.Render("  ·  "+time.Now().Format("15:04:05")+
+			"  ·  hosts "+fmt.Sprintf("%d (%s)", len(m.Machines), joinHosts(m.Machines))+
+			"  ·  plan "+fallback(m.Subscription, "?")+
+			"  ·  window "+fallback(m.Window, "?")+"  ")
+	right := freshnessLabel(m.Machines)
+	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		gap = 1
+	}
+	return left + strings.Repeat(" ", gap) + right
+}
+
+// dashboardHosts renders a one-line-per-machine summary inline with the
+// section header, so a single-host setup takes 1 row total.
 func dashboardHosts(m merger.Merged, w int) string {
-	header := labelStyle.Render("HOSTS")
 	if len(m.Machines) == 0 {
-		return header
+		return labelStyle.Render("HOSTS") + " " + dimStyle.Render("none")
 	}
 	now := time.Now()
-	rows := []string{header}
+	parts := []string{labelStyle.Render("HOSTS")}
 	for _, mi := range m.Machines {
 		age := now.Sub(time.Unix(mi.TS, 0))
 		fresh := okStyle.Render("fresh")
@@ -327,15 +341,54 @@ func dashboardHosts(m merger.Merged, w int) string {
 		case age > 2*time.Minute:
 			fresh = warnStyle.Render(short(age))
 		}
-		rows = append(rows, fmt.Sprintf("  %-16s %s tokens · %d projects · %d sessions · %s",
-			truncate(mi.Name, 16),
-			pad(fmtTokens(mi.Total), 7),
-			mi.Projects,
-			mi.Sessions,
-			fresh,
-		))
+		parts = append(parts, fmt.Sprintf("%s %s·%dp·%ds·%s",
+			mi.Name, fmtTokens(mi.Total), mi.Projects, mi.Sessions, fresh))
+	}
+	// If many machines, split across lines.
+	line := strings.Join(parts, "  ")
+	if lipgloss.Width(line) <= w {
+		return line
+	}
+	// Fall back: header on its own row, machines below indented.
+	rows := []string{labelStyle.Render("HOSTS")}
+	for _, mi := range m.Machines {
+		age := now.Sub(time.Unix(mi.TS, 0))
+		fresh := okStyle.Render("fresh")
+		switch {
+		case age > 5*time.Minute:
+			fresh = errStyle.Render(short(age))
+		case age > 2*time.Minute:
+			fresh = warnStyle.Render(short(age))
+		}
+		rows = append(rows, fmt.Sprintf("  %-16s %s · %dp · %ds · %s",
+			truncate(mi.Name, 16), pad(fmtTokens(mi.Total), 7), mi.Projects, mi.Sessions, fresh))
 	}
 	return strings.Join(rows, "\n")
+}
+
+// dashboardTrends shows 24h and 7d sparklines stacked, each on a single line
+// with its totals on the right.
+func dashboardTrends(m merger.Merged, w int) string {
+	hourly := trendRow("24h", m.Hourly24h, w)
+	daily := trendRow(" 7d", m.Daily7d, w)
+	return strings.Join([]string{hourly, daily}, "\n")
+}
+
+func trendRow(label string, vals []int64, w int) string {
+	if len(vals) == 0 {
+		return labelStyle.Render(label) + " " + dimStyle.Render("no data")
+	}
+	var sum int64
+	for _, v := range vals {
+		sum += v
+	}
+	totals := dimStyle.Render(fmt.Sprintf("%s · peak %s",
+		fmtTokens(sum), fmtTokens(maxInt64(vals))))
+	barW := w - lipgloss.Width(totals) - 7 // label + spacing
+	if barW < 10 {
+		barW = 10
+	}
+	return labelStyle.Render(label) + " " + sparkline(vals, barW) + "  " + totals
 }
 
 // hostsLine renders a compact per-host attribution line like
@@ -353,22 +406,21 @@ func hostsLine(hosts []merger.HostContribution, w int) string {
 }
 
 func dashboardLimits(m merger.Merged, w int) string {
-	barW := w - 30
+	barW := w - 32
 	if barW < 10 {
 		barW = 10
 	}
 	return strings.Join([]string{
-		fmt.Sprintf("%-8s %s  %s   %s",
+		fmt.Sprintf("%-8s %s  %s  %s",
 			labelStyle.Render("SESSION"),
 			barRanked(m.Session.Pct, barW),
 			pct(m.Session.Pct),
-			dimStyle.Render("resets "+short(m.Session.ResetIn()))),
-		fmt.Sprintf("%-8s %s  %s   %s",
+			dimStyle.Render("· resets "+short(m.Session.ResetIn()))),
+		fmt.Sprintf("%-8s %s  %s  %s",
 			labelStyle.Render("WEEK"),
 			barRanked(m.Week.Pct, barW),
 			pct(m.Week.Pct),
-			dimStyle.Render("resets "+short(m.Week.ResetIn()))),
-		dimStyle.Render("plan: "+fallback(m.Subscription, "?")+"    limit: "+fallback(m.Limit, "?")),
+			dimStyle.Render("· resets "+short(m.Week.ResetIn()))),
 	}, "\n")
 }
 
@@ -433,42 +485,22 @@ func dashboardProjects(m merger.Merged, w, visible, scroll int) string {
 }
 
 func dashboardModels(m merger.Merged, w int) string {
-	header := labelStyle.Render(fmt.Sprintf("MODELS (last %s)", fallback(m.Window, "?")))
+	header := labelStyle.Render("MODELS")
 	if len(m.ByModel) == 0 {
-		return strings.Join([]string{header, "", dimStyle.Render("no transcript data yet")}, "\n")
+		return strings.Join([]string{header, dimStyle.Render("no data")}, "\n")
 	}
-	rows := []string{header, ""}
+	rows := []string{header}
 	for _, mm := range m.ByModel {
+		nameW := w - 11
 		rows = append(rows,
-			fmt.Sprintf("%-*s %s", w-10, truncate(prettyModel(mm.Model), w-10),
+			fmt.Sprintf("%-*s %s",
+				nameW, truncate(prettyModel(mm.Model), nameW),
 				pad(fmtTokens(mm.Total()), 9)),
-			dimStyle.Render(fmt.Sprintf("  in=%s  out=%s  cache_hit=%.0f%%",
-				fmtTokens(mm.In), fmtTokens(mm.Out), mm.CacheHitRate())),
-			dimStyle.Render(fmt.Sprintf("  cache_read=%s  cache_create=%s  sessions=%d",
-				fmtTokens(mm.CacheR), fmtTokens(mm.CacheC), mm.Sessions)),
-			"",
+			dimStyle.Render(fmt.Sprintf("  in %s · out %s · cache %.0f%% · %d sess",
+				fmtTokens(mm.In), fmtTokens(mm.Out), mm.CacheHitRate(), mm.Sessions)),
 		)
 	}
 	return strings.Join(rows, "\n")
-}
-
-func dashboardHourly(m merger.Merged, w int) string {
-	header := labelStyle.Render("LAST 24h")
-	if len(m.Hourly24h) == 0 {
-		return strings.Join([]string{header, dimStyle.Render("no transcript data yet")}, "\n")
-	}
-	var sum int64
-	for _, v := range m.Hourly24h {
-		sum += v
-	}
-	totals := dimStyle.Render(fmt.Sprintf("total %s · peak %s",
-		fmtTokens(sum), fmtTokens(maxInt64(m.Hourly24h))))
-	barRoom := w - lipgloss.Width(totals) - 11 // "LAST 24h " + spacing
-	if barRoom < 10 {
-		barRoom = w - 11
-	}
-	spark := sparkline(m.Hourly24h, barRoom)
-	return header + " " + spark + "  " + totals
 }
 
 // ---- tabbed view (fallback for small terminals) ---------------------------
