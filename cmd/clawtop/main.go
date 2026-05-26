@@ -81,7 +81,18 @@ type model struct {
 	forceTabbed     bool
 	forceDashboard  bool
 	scrollProjects  int
+	history         []probeSample // last ~20 probes, for burn-rate calc
 }
+
+// probeSample records one observation of the rate-limit windows over time.
+// We retain a small rolling window to derive a per-hour burn rate.
+type probeSample struct {
+	at         time.Time
+	sessionPct float64
+	weekPct    float64
+}
+
+const historyKeep = 30 // ~30 minutes at 1 sample/min equivalent
 
 func initialModel(dir, filter string) model {
 	m := model{dir: dir, machineFilter: filter}
@@ -114,11 +125,65 @@ func (m *model) reload() {
 			}
 		}
 		m.merged = merger.Merge(filtered)
+		// Record a sample for burn-rate; skip if percentages are zero (probe
+		// failed and we have no value to project from yet).
+		if m.merged.Session.Pct > 0 || m.merged.Week.Pct > 0 {
+			m.history = append(m.history, probeSample{
+				at:         time.Unix(m.merged.TS, 0),
+				sessionPct: m.merged.Session.Pct,
+				weekPct:    m.merged.Week.Pct,
+			})
+			if len(m.history) > historyKeep {
+				m.history = m.history[len(m.history)-historyKeep:]
+			}
+		}
 	}
 	maxScroll := m.maxProjectScroll(m.projectsVisible())
 	if m.scrollProjects > maxScroll {
 		m.scrollProjects = maxScroll
 	}
+}
+
+// burnRate returns the percentage-per-hour rate for the two windows,
+// computed from history. Returns 0,0 when we don't yet have two distinct
+// samples or when both values are flat.
+func (m model) burnRate() (sessionRate, weekRate float64) {
+	if len(m.history) < 2 {
+		return 0, 0
+	}
+	first := m.history[0]
+	last := m.history[len(m.history)-1]
+	dt := last.at.Sub(first.at).Hours()
+	if dt <= 0 {
+		return 0, 0
+	}
+	dsess := last.sessionPct - first.sessionPct
+	dweek := last.weekPct - first.weekPct
+	if dsess < 0 {
+		dsess = 0 // a reset crossed the window; don't show negative
+	}
+	if dweek < 0 {
+		dweek = 0
+	}
+	return dsess / dt, dweek / dt
+}
+
+// projectionLine builds the burn-rate suffix for one limit window.
+// Returns empty string if no useful projection (no samples or flat).
+func projectionLine(pct float64, ratePerHour float64, resetIn time.Duration) string {
+	if ratePerHour <= 0 || pct >= 100 {
+		return ""
+	}
+	hoursToCap := (100 - pct) / ratePerHour
+	d := time.Duration(hoursToCap * float64(time.Hour))
+	tag := okStyle.Render("ok")
+	if resetIn > 0 && d < resetIn {
+		tag = errStyle.Render("OVER!")
+	} else if resetIn > 0 && d < resetIn+30*time.Minute {
+		tag = warnStyle.Render("close")
+	}
+	return fmt.Sprintf(" · +%.1f%%/h · 100%% in %s · %s",
+		ratePerHour, short(d), tag)
 }
 
 // cycleFilter advances machineFilter through "", host1, host2, ..., back to "".
@@ -312,7 +377,7 @@ func (m model) viewDashboard() string {
 	header := m.dashboardHeader(innerW)
 
 	// Limits: just two bars + reset, plan/limit goes into header line.
-	limits := dashboardLimits(merged, innerW)
+	limits := m.dashboardLimits(innerW)
 
 	// Projects + Models side by side.
 	leftW := innerW * 60 / 100
@@ -480,7 +545,9 @@ func hostsLine(hosts []merger.HostContribution, w int) string {
 	return s
 }
 
-func dashboardLimits(m merger.Merged, w int) string {
+func (m model) dashboardLimits(w int) string {
+	merged := m.merged
+	sessR, weekR := m.burnRate()
 	barW := w - 32
 	if barW < 10 {
 		barW = 10
@@ -488,14 +555,16 @@ func dashboardLimits(m merger.Merged, w int) string {
 	return strings.Join([]string{
 		fmt.Sprintf("%-8s %s  %s  %s",
 			labelStyle.Render("SESSION"),
-			barRanked(m.Session.Pct, barW),
-			pct(m.Session.Pct),
-			dimStyle.Render("· resets "+short(m.Session.ResetIn()))),
+			barRanked(merged.Session.Pct, barW),
+			pct(merged.Session.Pct),
+			dimStyle.Render("· resets "+short(merged.Session.ResetIn())+
+				projectionLine(merged.Session.Pct, sessR, merged.Session.ResetIn()))),
 		fmt.Sprintf("%-8s %s  %s  %s",
 			labelStyle.Render("WEEK"),
-			barRanked(m.Week.Pct, barW),
-			pct(m.Week.Pct),
-			dimStyle.Render("· resets "+short(m.Week.ResetIn()))),
+			barRanked(merged.Week.Pct, barW),
+			pct(merged.Week.Pct),
+			dimStyle.Render("· resets "+short(merged.Week.ResetIn())+
+				projectionLine(merged.Week.Pct, weekR, merged.Week.ResetIn()))),
 	}, "\n")
 }
 
@@ -571,8 +640,9 @@ func dashboardModels(m merger.Merged, w int) string {
 			fmt.Sprintf("%-*s %s",
 				nameW, truncate(prettyModel(mm.Model), nameW),
 				pad(fmtTokens(mm.Total()), 9)),
-			dimStyle.Render(fmt.Sprintf("  in %s · out %s · cache %.0f%% · %d sess",
-				fmtTokens(mm.In), fmtTokens(mm.Out), mm.CacheHitRate(), mm.Sessions)),
+			dimStyle.Render(fmt.Sprintf("  in %s · out %s · cache %.0f%% (saved ~%s) · %d sess",
+				fmtTokens(mm.In), fmtTokens(mm.Out), mm.CacheHitRate(),
+				fmtTokens(int64(float64(mm.CacheR)*0.9)), mm.Sessions)),
 		)
 	}
 	return strings.Join(rows, "\n")
@@ -593,7 +663,7 @@ func (m model) viewTabbed() string {
 	var body string
 	switch m.tab {
 	case tabLimits:
-		body = viewLimits(m.merged, innerW)
+		body = m.viewLimits(innerW)
 	case tabProjects:
 		body = viewProjects(m.merged, innerW, m.projectsVisible(), m.scrollProjects)
 	case tabModels:
@@ -606,8 +676,13 @@ func (m model) viewTabbed() string {
 		body = viewHourly(m.merged, innerW)
 	}
 
+	filterPart := ""
+	if m.machineFilter != "" {
+		filterPart = "  ·  " + warnStyle.Render("filter "+m.machineFilter)
+	}
 	header := titleStyle.Render("clawtop") +
 		dimStyle.Render("  ·  "+time.Now().Format("15:04:05")) +
+		filterPart +
 		"   " + tabsRow(m.tab)
 	footer := footerLine(m.merged, innerW)
 
@@ -640,18 +715,22 @@ func footerLine(m merger.Merged, w int) string {
 	return dimStyle.Render(left) + staleness + strings.Repeat(" ", gap) + dimStyle.Render(right)
 }
 
-func viewLimits(m merger.Merged, w int) string {
+func (m model) viewLimits(w int) string {
+	merged := m.merged
+	sessR, weekR := m.burnRate()
 	barW := w - 12
 	return strings.Join([]string{
 		labelStyle.Render("SESSION  (5h)"),
-		barRanked(m.Session.Pct, barW) + "  " + pct(m.Session.Pct),
-		dimStyle.Render("resets in " + short(m.Session.ResetIn())),
+		barRanked(merged.Session.Pct, barW) + "  " + pct(merged.Session.Pct),
+		dimStyle.Render("resets in " + short(merged.Session.ResetIn()) +
+			projectionLine(merged.Session.Pct, sessR, merged.Session.ResetIn())),
 		"",
 		labelStyle.Render("WEEK     (7d)"),
-		barRanked(m.Week.Pct, barW) + "  " + pct(m.Week.Pct),
-		dimStyle.Render("resets in " + short(m.Week.ResetIn())),
+		barRanked(merged.Week.Pct, barW) + "  " + pct(merged.Week.Pct),
+		dimStyle.Render("resets in " + short(merged.Week.ResetIn()) +
+			projectionLine(merged.Week.Pct, weekR, merged.Week.ResetIn())),
 		"",
-		dimStyle.Render("plan: " + fallback(m.Subscription, "?") + "    limit: " + fallback(m.Limit, "?")),
+		dimStyle.Render("plan: " + fallback(merged.Subscription, "?") + "    limit: " + fallback(merged.Limit, "?")),
 	}, "\n")
 }
 
@@ -666,12 +745,14 @@ func viewProjects(m merger.Merged, w, visible, scroll int) string {
 			maxT = p.Total()
 		}
 	}
-	nameW := 28
-	numW := 12
-	barW := w - nameW - numW - 4
+	nameW := 26
+	numW := 10
+	touchW := 10
+	barW := w - nameW - numW - touchW - 4
 	if barW < 10 {
 		barW = 10
 	}
+	now := time.Now()
 	rows := []string{header, ""}
 	end := scroll + visible
 	if end > len(m.ByProject) {
@@ -683,10 +764,15 @@ func viewProjects(m merger.Merged, w, visible, scroll int) string {
 		if maxT > 0 {
 			ratio = float64(p.Total()) / float64(maxT) * 100
 		}
-		rows = append(rows, fmt.Sprintf("%-*s %s  %s",
+		touched := "—"
+		if p.LastAt > 0 {
+			touched = short(now.Sub(time.Unix(p.LastAt, 0))) + " ago"
+		}
+		rows = append(rows, fmt.Sprintf("%-*s %s  %s  %s",
 			nameW, truncate(p.Name, nameW),
 			barNeutral(ratio, barW),
 			pad(fmtTokens(p.Total()), numW),
+			dimStyle.Render(pad(touched, touchW)),
 		))
 		if hosts, ok := m.HostsByProject[p.Path]; ok {
 			rows = append(rows, dimStyle.Render("  "+hostsLine(hosts, w-2)))
@@ -724,6 +810,9 @@ func viewModels(m merger.Merged, w int) string {
 		if maxT > 0 {
 			ratio = float64(mm.Total()) / float64(maxT) * 100
 		}
+		// Cache savings: cached read tokens cost 10% of normal input.
+		// Approximate saved tokens at 90% of cache_read.
+		saved := int64(float64(mm.CacheR) * 0.9)
 		rows = append(rows,
 			fmt.Sprintf("%-*s %s  %s",
 				nameW, truncate(prettyModel(mm.Model), nameW),
@@ -733,8 +822,8 @@ func viewModels(m merger.Merged, w int) string {
 				nameW, "",
 				fmtTokens(mm.In), fmtTokens(mm.Out),
 				fmtTokens(mm.CacheR), fmtTokens(mm.CacheC))),
-			dimStyle.Render(fmt.Sprintf("%-*s  cache_hit=%.0f%%  sessions=%d",
-				nameW, "", mm.CacheHitRate(), mm.Sessions)),
+			dimStyle.Render(fmt.Sprintf("%-*s  cache_hit=%.0f%% (saved ~%s)  sessions=%d",
+				nameW, "", mm.CacheHitRate(), fmtTokens(saved), mm.Sessions)),
 		)
 	}
 	return strings.Join(rows, "\n")

@@ -1,33 +1,45 @@
 # clawtop
 
-A TUI dashboard for your Anthropic Claude usage. Always-on, multi-host
-aware, and built so the OAuth credentials never leave the machine that
+A dense TUI dashboard for your Anthropic Claude usage. Single PC or
+many. Built so the OAuth credentials never leave the machine that
 already holds them.
 
 ```
-╭─ clawtop · 14:32:01   1 Limits · 2 Projects · 3 Models · 4 Hourly ─────╮
-│                                                                         │
-│  SESSION  (5h)                                                          │
-│  ████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░     42.1%            │
-│  resets in 2h 17m                                                       │
-│                                                                         │
-│  WEEK     (7d)                                                          │
-│  ██████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░     24.4%            │
-│  resets in 4d 8h                                                        │
-│                                                                         │
-│  plan: max    limit: allowed                                            │
-│                                                                         │
-│  hosts: 3 (laptop,omen,workpc)  window: 7d  fresh                       │
-│  tab/← → switch · 1-4 jump · r reload · q quit                          │
-╰─────────────────────────────────────────────────────────────────────────╯
+clawtop · 19:23:04 · hosts 2 (omen,pop-os) · plan team · window 7d              fresh
+──────────────────────────────────────────────────────────────────────────────────────
+SESSION  ██████████▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  31.0%  · resets 29m
+WEEK     █▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒   5.0%  · resets 6d 8h
+──────────────────────────────────────────────────────────────────────────────────────
+TOP PROJECTS (last 7d)                       MODELS
+rifeli              1.9M ████████████▒▒▒▒▒   opus-4-7                       4.5M
+  omen 1.9M · pop-os 18.0k                     in 200.8k · out 4.3M · cache 100% · 32 sess
+rifeli.dev        874.4k ███████▒▒▒▒▒▒▒▒▒▒
+  3 sessions
+main-flora        731.2k ██████▒▒▒▒▒▒▒▒▒▒▒
+  2 sessions
+nzomukongo        396.4k ███▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+  6 sessions
+jarvis-text-anls. 195.0k ██▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+  omen 151.2k · pop-os 43.8k
+──────────────────────────────────────────────────────────────────────────────────────
+HOSTS  omen 3.5M·7p·20s·fresh   pop-os 1.0M·8p·12s·fresh
+──────────────────────────────────────────────────────────────────────────────────────
+TOP SESSIONS
+  rifeli                 1.2M     opus-4-7      · 2h ago
+  rifeli                 201k     opus-4-7      · 14m ago
+  rifeli.dev             196k     opus-4-7      · 3h ago
+──────────────────────────────────────────────────────────────────────────────────────
+24h ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁█▄▁▁▁▁▁█        1.6M · peak 507.1k
+ 7d ▁▂▃▄▅█▃                          4.5M · peak 1.6M
+t tabbed · f filter host · j/k scroll · g/G top/end · r reload · q quit
 ```
 
-## Quickstart — single PC (most people)
+## Quickstart — single PC
 
 You run Claude on one machine and want a dashboard on that same machine.
 
 ```bash
-# 1. Install both binaries.
+# 1. Install binaries + systemd unit files.
 curl -fsSL https://raw.githubusercontent.com/leonardorifeli/clawtop/main/install.sh | sh
 
 # 2. Verify everything is wired correctly.
@@ -36,60 +48,67 @@ clawtopd doctor
 # OK    anthropic     api.anthropic.com             session=12.1% week=4.3%
 # OK    destination   local:~/.local/share/clawtop  writable
 
-# 3. Run the daemon as a user service.
-install -Dm644 /usr/lib/systemd/user/clawtopd-local.service ~/.config/systemd/user/clawtopd-local.service 2>/dev/null \
-  || curl -fsSL https://raw.githubusercontent.com/leonardorifeli/clawtop/main/deploy/clawtopd-local.service \
-       -o ~/.config/systemd/user/clawtopd-local.service
+# 3. Enable the daemon.
 systemctl --user daemon-reload
 systemctl --user enable --now clawtopd-local
 
-# 4. Open the dashboard whenever you want.
-clawtop
+# 4. Open the dashboard.
+clawtop --dir=~/.local/share/clawtop
 ```
 
-No SSH, no remote host, no extra config. The daemon writes to
-`~/.local/share/clawtop/<machine>.json` and the TUI reads from there.
+That's it. The daemon writes `~/.local/share/clawtop/<machine>.json` once
+a minute; the TUI re-reads every second.
 
 ## Quickstart — multi PC (N daemons → 1 viewer)
 
 You run Claude on several machines (laptop, desktop, work box) and want
-one dashboard that merges them. The OAuth credentials stay on each Claude
-machine; only the derived JSON travels.
+one dashboard that merges them, displayed on a homelab box, a Pi, an old
+NUC, or any always-on machine you can SSH into. The OAuth credentials
+stay on each Claude machine; only the derived JSON travels.
 
 ```bash
+# --- On the viewer host (once) ---
+sudo install -d -o $USER -g $USER /var/lib/clawtop
+curl -fsSL https://raw.githubusercontent.com/leonardorifeli/clawtop/main/install.sh | sh -s -- viewer
+systemctl --user daemon-reload
+systemctl --user enable --now clawtop                 # launches tmux session
+sudo loginctl enable-linger $USER                     # survives logout
+
 # --- On each machine that runs Claude ---
 curl -fsSL https://raw.githubusercontent.com/leonardorifeli/clawtop/main/install.sh | sh -s -- daemon
-clawtopd doctor --host=<viewer-alias>       # verify SSH and remote write
-# Edit deploy/clawtopd-remote.service to set --host=<viewer-alias>, then:
-install -Dm644 clawtopd-remote.service ~/.config/systemd/user/
+# Edit the unit to set --host=<your-viewer-ssh-alias>
+${EDITOR:-vi} ~/.config/systemd/user/clawtopd-remote.service
+clawtopd doctor --host=<your-viewer-alias>            # 4 OKs expected
 systemctl --user daemon-reload
 systemctl --user enable --now clawtopd-remote
 
-# --- On the viewer host (any always-on box you can SSH into) ---
-sudo install -d -o $USER -g $USER /var/lib/clawtop
-curl -fsSL https://raw.githubusercontent.com/leonardorifeli/clawtop/main/install.sh | sh -s -- viewer
-install -Dm644 clawtop.service ~/.config/systemd/user/
-systemctl --user enable --now clawtop
-sudo loginctl enable-linger $USER           # keep the user service alive
-
-# Then to look:
+# --- Look at it from anywhere ---
 ssh <viewer-host>
 tmux attach -t clawtop
 ```
 
-The full multi-PC walkthrough (with SSH setup, troubleshooting, etc.) is
-in [`deploy/INSTALL.md`](deploy/INSTALL.md).
+The full multi-PC walkthrough (with SSH setup, troubleshooting, the
+common gotchas around SSH alias users and copy-pasted long URLs) is in
+[`deploy/INSTALL.md`](deploy/INSTALL.md).
 
-## What it answers, in four tabs
+## What it answers
 
-1. **Limits** — how much of your 5-hour and 7-day rate-limit windows you
-   are using, and when they reset.
+Six tabs, or one dense dashboard view (default when terminal is ≥80×18):
+
+1. **Limits** — 5h and 7d rate-limit windows with reset countdowns.
 2. **Projects** — which working directories ate your token budget over
-   the chosen lookback window.
-3. **Models** — Opus vs Sonnet vs Haiku split, with input, output, and
-   cache-read/cache-create columns.
-4. **Hourly** — a 24-hour sparkline of token consumption so you can spot
-   the peak hours.
+   the chosen window; per-host attribution when two or more machines
+   contributed to the same project; session count per project.
+3. **Models** — Opus vs Sonnet vs Haiku split, input/output/cache
+   columns, **cache hit rate**, distinct session count per model.
+4. **Hosts** — per-machine totals: tokens contributed, distinct
+   projects, distinct sessions, freshness.
+5. **Sessions** — top 10 most expensive conversations in the window,
+   with project, model, duration, last-seen.
+6. **Hourly** — 24h sparkline plus 7d daily breakdown.
+
+Press `f` to filter to a single host (cycles through all → omen → pop-os
+→ all). Or start with `clawtop --machine=omen` to lock to one machine.
 
 ## What it isn't (and what to use instead)
 
@@ -102,10 +121,12 @@ transcripts. Pick the shape that matches your use case:
 | [`Claude-Code-Usage-Monitor`](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor) | Always-on terminal monitor with burn-rate predictions | You want ML projections on a single host |
 | [`ccflare`](https://claudefa.st/blog/tools/monitors/claude-code-usage-monitor) | Browser dashboard | You want graphs you can pan and zoom |
 | [`Clawdmeter`](https://github.com/HermannBjorgvin/Clawdmeter) | ESP32 hardware display | You want a physical Clawd on your desk |
-| **`clawtop`** | TUI, single PC or **multi-host aware** | You run Claude on more than one machine, want one place to look, and don't want to copy credentials around |
+| **`clawtop`** | Dense TUI, single PC or **multi-host aware**, displays on any always-on screen | You run Claude on more than one machine, want one place to look, and don't want to copy OAuth credentials around |
 
 If you only run Claude on a single laptop and just want a quick table,
-`ccusage` is probably what you want.
+`ccusage` is probably what you want. clawtop earns its keep when you
+have several boxes (work laptop + personal desktop + dev VM + homelab)
+and want a unified, always-on view.
 
 ## Architecture
 
@@ -143,20 +164,22 @@ If you only run Claude on a single laptop and just want a quick table,
    api.anthropic.com
 ```
 
-Either way: the daemon polls Anthropic every 60 s with `max_tokens: 1` to
-read the `anthropic-ratelimit-unified-*` headers, and walks
-`~/.claude/projects/**/*.jsonl` to aggregate per-project, per-model, and
-hourly token usage from your local transcripts.
+The daemon polls Anthropic every 60s with `max_tokens: 1` to read the
+`anthropic-ratelimit-unified-*` response headers, and walks
+`~/.claude/projects/**/*.jsonl` to aggregate per-project, per-model,
+hourly, and daily token usage from your local transcripts. The merger
+on the viewer side keeps account-scoped fields from the freshest report
+and sums everything else element-wise.
 
 ## Credentials never travel
 
 `clawtopd` runs as a systemd `--user` service, so it inherits the same
 file permissions as your interactive shell. It reads
 `~/.claude/.credentials.json` like any other file, then talks to
-Anthropic from the same host. The viewer (whether on the same PC or on a
-remote box) only sees the derived JSON — never the OAuth token. If a
-remote viewer host is compromised, the attacker gets percentages and
-token counts, not your account.
+Anthropic from the same host. The viewer — whether on the same PC or on
+a remote box — only sees the derived JSON (rate-limit percentages,
+token counts, session metadata). If the viewer host is compromised, the
+attacker gets numbers, not the OAuth token.
 
 ## Configuration
 
@@ -175,46 +198,56 @@ token counts, not your account.
 | `--local-only` | `false` | print to stdout instead of writing |
 | `--skip-probe` | `false` | skip the Anthropic call, aggregate transcripts only |
 
-`clawtopd doctor` accepts the same flags and runs three preflight checks:
-credentials are readable, Anthropic responds, destination is writable.
+`clawtopd doctor` accepts the same flags and runs four preflight checks:
+credentials are readable, Anthropic responds, SSH alias is reachable
+(if remote), destination is writable.
 
-`clawtop`:
+`clawtop` (viewer):
 
 | flag | default | what |
 |------|---------|------|
 | `--dir` | `/var/lib/clawtop` | directory of per-machine status JSON files |
+| `--machine` | "" (all merged) | show only the named machine's data |
 
-For single-PC use, point the TUI at the daemon's local dir:
-`clawtop --dir=~/.local/share/clawtop`.
+Key bindings: `tab`/`shift-tab` or `←`/`→` cycle tabs, `1`–`6` jump
+directly, `t` toggle dashboard/tabbed, `f` cycle host filter,
+`j`/`k`/`g`/`G`/`PgUp`/`PgDn` scroll the project list, `r` reload, `q`
+quit.
 
-Key bindings: `tab`/`shift-tab` or `←` `→` to switch tabs, `1`–`4` to
-jump, `r` to reload, `q` to quit.
-
-## Status JSON (schema 2)
+## Status JSON (schema 3)
 
 ```json
 {
-  "schema": 2,
-  "machine": "laptop",
+  "schema": 3,
+  "machine": "omen",
   "ts": 1716688320,
-  "session": { "pct": 42.1, "reset_at": 1716700000 },
-  "week":    { "pct": 24.4, "reset_at": 1717100000 },
+  "session": { "pct": 31.0, "reset_at": 1716700000 },
+  "week":    { "pct":  5.0, "reset_at": 1717100000 },
   "limit":   "allowed",
-  "subscription": "max",
+  "subscription": "team",
   "window":  "7d",
+  "sessions": 20,
   "by_project": [
-    { "name": "my-app", "path": "/home/you/code/my-app",
-      "in": 255, "out": 172668, "cache_read": 18684, "cache_create": 8921 }
+    { "name": "rifeli", "path": "/home/rifeli/projects/personal/rifeli",
+      "in": 12345, "out": 1900000, "cache_read": 45e6, "cache_create": 1.4e6,
+      "sessions": 5 }
   ],
   "by_model": [
     { "model": "claude-opus-4-7",
-      "in": 2751, "out": 632241, "cache_read": 53152478, "cache_create": 0 }
+      "in": 200800, "out": 4300000, "cache_read": 462500000, "cache_create": 14600000,
+      "sessions": 32 }
   ],
-  "hourly_24h": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 107835, 7436, 0, 0, 0, 0, 0, 0, 178055]
+  "hourly_24h": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 107835, 7436, 0, 0, 0, 0, 0, 0, 178055],
+  "daily_7d":   [120000, 250000, 80000, 400000, 600000, 1100000, 1300000],
+  "top_sessions": [
+    { "id": "abc-...", "project": "rifeli", "model": "claude-opus-4-7",
+      "in": 186931, "out": 966588, "started_at": 1716680000, "last_at": 1716688000 }
+  ]
 }
 ```
 
 Tiny payload (~1–5 KB per machine), self-describing, forward-compatible.
+Old viewers ignore unknown fields; new viewers default-zero missing ones.
 
 ## Repo layout
 
@@ -224,10 +257,10 @@ clawtop/
 │   ├── clawtop/        # TUI binary
 │   └── clawtopd/       # daemon binary + doctor subcommand
 ├── external/           # adapters to the outside world
-│   ├── anthropic/      # Anthropic API client (creds + probe)
-│   └── push/           # Pusher interface + local + ssh implementations
+│   ├── anthropic/      # API client (creds + probe)
+│   └── push/           # Pusher interface + Local + SSH implementations
 ├── internal/
-│   ├── domain/         # on-the-wire entities (Status, Window, Project, Model)
+│   ├── domain/         # on-the-wire entities
 │   └── service/        # business logic
 │       ├── collector/  # parse transcripts → aggregate
 │       └── merger/     # merge N per-machine payloads
@@ -236,21 +269,23 @@ clawtop/
 
 ## Cost
 
-One Haiku call with `max_tokens: 1` per minute per daemon. On a Max plan
-this is billed against the same subscription quota you're watching and
-shows up in the very dashboard you're looking at. Three machines combined
-add up to a single-digit number of cents per month.
+One Haiku call with `max_tokens: 1` per minute per daemon. On a Max or
+Team plan this is billed against the same subscription quota you're
+watching and shows up in the very dashboard you're looking at. Three
+machines combined add up to a single-digit number of cents per month.
 
 ## Contributing
 
-PRs welcome. The whole thing is around 800 lines of Go.
+PRs welcome. The whole thing is around 1000 lines of Go. See
+[`CHANGELOG`](https://github.com/leonardorifeli/clawtop/releases) for
+the release-by-release feature list.
 
 ## Credits
 
 This project would not exist without
 [Clawdmeter](https://github.com/HermannBjorgvin/Clawdmeter) by
 [Hermann Bjorgvin](https://github.com/HermannBjorgvin), which is where I
-learned that the Anthropic OAuth surface exposes the `unified` rate-limit
+learned the Anthropic OAuth surface exposes the `unified` rate-limit
 headers, and [ccusage](https://github.com/ryoppippi/ccusage) by
 [ryoppippi](https://github.com/ryoppippi), which set the bar for what
 transcript-derived analysis should look like.

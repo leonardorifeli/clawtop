@@ -120,6 +120,23 @@ case "$WHAT" in
     ;;
 esac
 
+# Auto-restart any enabled clawtop services so this script doubles as an
+# "update" command. Best-effort: silent when no systemd, no services, etc.
+restart_enabled() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+  systemctl --user daemon-reload 2>/dev/null || return 0
+  for svc in clawtopd-local clawtopd-remote clawtop; do
+    if systemctl --user is-enabled "$svc" >/dev/null 2>&1; then
+      if systemctl --user restart "$svc" 2>/dev/null; then
+        info "Restarted $svc"
+      fi
+    fi
+  done
+}
+restart_enabled
+
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) info "Note: $BIN_DIR is not on \$PATH. Add it to your shell rc." ;;
@@ -127,7 +144,7 @@ esac
 
 cat <<EOF
 
-Next steps:
+Next steps (first install only — re-running this script also updates):
   clawtopd doctor                                     # verify credentials, anthropic, destination
   systemctl --user daemon-reload
   systemctl --user enable --now clawtopd-local        # single-PC; for multi-PC use clawtopd-remote

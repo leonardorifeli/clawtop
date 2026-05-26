@@ -24,6 +24,7 @@ type Project struct {
 	CacheR   int64  `json:"cache_read"`
 	CacheC   int64  `json:"cache_create"`
 	Sessions int    `json:"sessions"`       // distinct conversation count in the window
+	LastAt   int64  `json:"last_at"`        // unix seconds of most recent assistant message
 }
 
 // Model aggregates token usage by model id (e.g. claude-opus-4-7).

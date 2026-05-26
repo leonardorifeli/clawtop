@@ -106,6 +106,9 @@ func Merge(parts []domain.Status) Merged {
 				ex.CacheR += pj.CacheR
 				ex.CacheC += pj.CacheC
 				ex.Sessions += pj.Sessions
+				if pj.LastAt > ex.LastAt {
+					ex.LastAt = pj.LastAt
+				}
 			}
 
 			// Record per-host contribution for this project.

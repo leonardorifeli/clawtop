@@ -205,6 +205,9 @@ func apply(
 	pj.Out += p.out
 	pj.CacheR += p.cacheR
 	pj.CacheC += p.cacheC
+	if ts := p.ts.Unix(); ts > pj.LastAt {
+		pj.LastAt = ts
+	}
 
 	if p.model != "" {
 		m, ok := models[p.model]
