@@ -7,8 +7,10 @@ Type=forking
 Environment=TERM=xterm-256color
 # Create (idempotent) a detached tmux session named 'clawtop' running the TUI.
 # Attach from anywhere with: tmux attach -t clawtop
-ExecStart=/usr/bin/tmux new-session -d -s clawtop '%h/.local/bin/clawtop --path=/var/lib/clawtop/status.json'
-ExecStop=/usr/bin/tmux kill-session -t clawtop
+ExecStart=/usr/bin/tmux new-session -d -s clawtop '%h/.local/bin/clawtop --dir=/var/lib/clawtop'
+# Leading "-" tells systemd to ignore non-zero exit on cold stop when the
+# session does not exist yet.
+ExecStop=-/usr/bin/tmux kill-session -t clawtop
 Restart=on-failure
 RestartSec=5s
 
