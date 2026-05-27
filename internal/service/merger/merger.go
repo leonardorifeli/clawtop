@@ -23,7 +23,10 @@ type Merged struct {
 	ByModel      []domain.Model
 	Hourly24h    []int64
 	Daily7d      []int64
-	TopSessions  []domain.SessionStat // top N across all hosts
+	Heatmap      [168]int64
+	WebSearch    int64
+	WebFetch     int64
+	TopSessions  []domain.SessionStat
 
 	// HostsByProject[projectPath] -> list of (host, in, out) contributions,
 	// sorted by tokens desc. Populated only when more than one host
@@ -34,15 +37,15 @@ type Merged struct {
 type MachineInfo struct {
 	Name     string
 	TS       int64
-	Total    int64 // tokens reported by this host in the window
-	Projects int   // distinct projects on this host
-	Sessions int   // sessions reported by this host
+	Total    int64
+	Projects int
+	Sessions int
 }
 
 type HostContribution struct {
-	Host   string
-	In     int64
-	Out    int64
+	Host string
+	In   int64
+	Out  int64
 }
 
 func (c HostContribution) Total() int64 { return c.In + c.Out }
@@ -57,7 +60,6 @@ func Merge(parts []domain.Status) Merged {
 		return out
 	}
 
-	// Pick freshest by TS for rate-limit / subscription / window labels.
 	freshest := 0
 	for i := 1; i < len(parts); i++ {
 		if parts[i].TS > parts[freshest].TS {
@@ -74,8 +76,9 @@ func Merge(parts []domain.Status) Merged {
 
 	projects := map[string]*domain.Project{}
 	models := map[string]*domain.Model{}
-	// Working maps for per-host attribution.
 	hostsByProject := map[string]map[string]*HostContribution{}
+	// Branch aggregates merged across hosts, keyed by (path, branch).
+	branches := map[string]map[string]*domain.BranchStat{}
 
 	for _, p := range parts {
 		var hostTotal int64
@@ -90,6 +93,8 @@ func Merge(parts []domain.Status) Merged {
 			Sessions: p.Sessions,
 		})
 		out.Sessions += p.Sessions
+		out.WebSearch += p.WebSearch
+		out.WebFetch += p.WebFetch
 
 		for _, pj := range p.ByProject {
 			key := pj.Path
@@ -99,6 +104,7 @@ func Merge(parts []domain.Status) Merged {
 			ex, ok := projects[key]
 			if !ok {
 				cp := pj
+				cp.Branches = nil // we'll rebuild branches below
 				projects[key] = &cp
 			} else {
 				ex.In += pj.In
@@ -106,12 +112,31 @@ func Merge(parts []domain.Status) Merged {
 				ex.CacheR += pj.CacheR
 				ex.CacheC += pj.CacheC
 				ex.Sessions += pj.Sessions
+				ex.PrevIn += pj.PrevIn
+				ex.PrevOut += pj.PrevOut
 				if pj.LastAt > ex.LastAt {
 					ex.LastAt = pj.LastAt
 				}
 			}
 
-			// Record per-host contribution for this project.
+			// Branches: union across hosts.
+			if len(pj.Branches) > 0 {
+				if branches[key] == nil {
+					branches[key] = map[string]*domain.BranchStat{}
+				}
+				for _, b := range pj.Branches {
+					bb, ok := branches[key][b.Branch]
+					if !ok {
+						cp := b
+						branches[key][b.Branch] = &cp
+					} else {
+						bb.In += b.In
+						bb.Out += b.Out
+						bb.Sessions += b.Sessions
+					}
+				}
+			}
+
 			if hostsByProject[key] == nil {
 				hostsByProject[key] = map[string]*HostContribution{}
 			}
@@ -136,6 +161,10 @@ func Merge(parts []domain.Status) Merged {
 			ex.CacheR += m.CacheR
 			ex.CacheC += m.CacheC
 			ex.Sessions += m.Sessions
+			ex.PrevIn += m.PrevIn
+			ex.PrevOut += m.PrevOut
+			ex.WebSearch += m.WebSearch
+			ex.WebFetch += m.WebFetch
 		}
 
 		for i := 0; i < 24 && i < len(p.Hourly24h); i++ {
@@ -144,8 +173,9 @@ func Merge(parts []domain.Status) Merged {
 		for i := 0; i < 7 && i < len(p.Daily7d); i++ {
 			out.Daily7d[i] += p.Daily7d[i]
 		}
-		// Session IDs are unique per machine; union the lists then re-sort
-		// and cap at the end.
+		for i := 0; i < 168; i++ {
+			out.Heatmap[i] += p.Heatmap[i]
+		}
 		out.TopSessions = append(out.TopSessions, p.TopSessions...)
 	}
 
@@ -154,6 +184,21 @@ func Merge(parts []domain.Status) Merged {
 	})
 	if len(out.TopSessions) > 10 {
 		out.TopSessions = out.TopSessions[:10]
+	}
+
+	// Attach merged branches to projects.
+	for key, byBranch := range branches {
+		if pj, ok := projects[key]; ok {
+			list := make([]domain.BranchStat, 0, len(byBranch))
+			for _, b := range byBranch {
+				list = append(list, *b)
+			}
+			sort.Slice(list, func(i, j int) bool { return list[i].Total() > list[j].Total() })
+			if len(list) > 8 {
+				list = list[:8]
+			}
+			pj.Branches = list
+		}
 	}
 
 	for _, v := range projects {
@@ -170,10 +215,10 @@ func Merge(parts []domain.Status) Merged {
 		return out.ByModel[i].Total() > out.ByModel[j].Total()
 	})
 
-	sort.Slice(out.Machines, func(i, j int) bool { return out.Machines[i].Total > out.Machines[j].Total })
+	sort.Slice(out.Machines, func(i, j int) bool {
+		return out.Machines[i].Total > out.Machines[j].Total
+	})
 
-	// Flatten per-host attribution into sorted slices. Skip projects with
-	// only one contributing host (no attribution to show).
 	for key, byHost := range hostsByProject {
 		if len(byHost) < 2 {
 			continue

@@ -59,6 +59,14 @@ nfpms:
         dst: /usr/lib/systemd/user/clawtopd-remote.service
       - src: deploy/clawtop.service
         dst: /usr/lib/systemd/user/clawtop.service
+      - src: deploy/clawtop-backup.service
+        dst: /usr/lib/systemd/user/clawtop-backup.service
+      - src: deploy/clawtop-backup.timer
+        dst: /usr/lib/systemd/user/clawtop-backup.timer
+      - src: deploy/clawtop-backup.sh
+        dst: /usr/local/bin/clawtop-backup.sh
+        file_info:
+          mode: 0755
       - src: README.md
         dst: /usr/share/doc/clawtop/README.md
       - src: deploy/INSTALL.md

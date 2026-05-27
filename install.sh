@@ -101,6 +101,16 @@ install_unit() {
   fi
 }
 
+# install_script copies a helper shell script into BIN_DIR alongside the
+# binaries. Used for the backup helper that runs on the viewer host.
+install_script() {
+  src="$TMP/deploy/$1"
+  dst="$BIN_DIR/$1"
+  [ -f "$src" ] || return 0
+  install -m 0755 "$src" "$dst"
+  info "Installed $dst"
+}
+
 case "$WHAT" in
   daemon)
     install_bin clawtopd
@@ -110,6 +120,9 @@ case "$WHAT" in
   viewer)
     install_bin clawtop
     install_unit clawtop.service
+    install_unit clawtop-backup.service
+    install_unit clawtop-backup.timer
+    install_script clawtop-backup.sh
     ;;
   both)
     install_bin clawtopd
@@ -117,6 +130,9 @@ case "$WHAT" in
     install_unit clawtopd-local.service
     install_unit clawtopd-remote.service
     install_unit clawtop.service
+    install_unit clawtop-backup.service
+    install_unit clawtop-backup.timer
+    install_script clawtop-backup.sh
     ;;
 esac
 

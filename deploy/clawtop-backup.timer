@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily archive of clawtop machine snapshots
+
+[Timer]
+# Fire at 00:05 every day. Persistent=true catches missed runs after
+# downtime so weekend offline streaks don't leave gaps.
+OnCalendar=*-*-* 00:05:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

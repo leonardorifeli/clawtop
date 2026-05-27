@@ -199,6 +199,9 @@ func runDaemon(args []string) {
 			s.Daily7d = agg.Daily7d
 			s.Sessions = agg.Sessions
 			s.TopSessions = agg.TopSessions
+			s.Heatmap = agg.Heatmap
+			s.WebSearch = agg.WebSearch
+			s.WebFetch = agg.WebFetch
 		}
 
 		payload, _ := json.Marshal(s)

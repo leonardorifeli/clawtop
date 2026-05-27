@@ -29,11 +29,12 @@ const (
 	tabModels   = 2
 	tabHosts    = 3
 	tabSessions = 4
-	tabHourly   = 5
-	tabCount    = 6
+	tabHeatmap  = 5
+	tabHourly   = 6
+	tabCount    = 7
 )
 
-var tabNames = []string{"Limits", "Projects", "Models", "Hosts", "Sessions", "Hourly"}
+var tabNames = []string{"Limits", "Projects", "Models", "Hosts", "Sessions", "Heatmap", "Hourly"}
 
 func main() {
 	var (
@@ -290,7 +291,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.tab = (m.tab + tabCount - 1) % tabCount
 			}
 			return m, nil
-		case "1", "2", "3", "4", "5", "6":
+		case "1", "2", "3", "4", "5", "6", "7":
 			if !m.useDashboard() {
 				m.tab = int(msg.String()[0] - '1')
 			}
@@ -672,6 +673,8 @@ func (m model) viewTabbed() string {
 		body = viewHosts(m.merged, innerW)
 	case tabSessions:
 		body = viewSessions(m.merged, innerW)
+	case tabHeatmap:
+		body = viewHeatmap(m.merged, innerW)
 	case tabHourly:
 		body = viewHourly(m.merged, innerW)
 	}
@@ -706,7 +709,7 @@ func footerLine(m merger.Merged, w int) string {
 	left := fmt.Sprintf("hosts: %d (%s)  window: %s  ",
 		len(m.Machines), joinHosts(m.Machines), fallback(m.Window, "?"))
 	staleness := freshnessLabel(m.Machines)
-	right := "tab/1-5 · t dash · f filter · r reload · q quit"
+	right := "tab/1-7 · t dash · f filter · r · q"
 	used := lipgloss.Width(left) + lipgloss.Width(staleness) + lipgloss.Width(right)
 	gap := w - used
 	if gap < 1 {
@@ -768,16 +771,36 @@ func viewProjects(m merger.Merged, w, visible, scroll int) string {
 		if p.LastAt > 0 {
 			touched = short(now.Sub(time.Unix(p.LastAt, 0))) + " ago"
 		}
-		rows = append(rows, fmt.Sprintf("%-*s %s  %s  %s",
+		rows = append(rows, fmt.Sprintf("%-*s %s  %s  %s  %s",
 			nameW, truncate(p.Name, nameW),
 			barNeutral(ratio, barW),
 			pad(fmtTokens(p.Total()), numW),
+			trendLabel(p.Total(), p.PrevTotal()),
 			dimStyle.Render(pad(touched, touchW)),
 		))
+		sub := ""
 		if hosts, ok := m.HostsByProject[p.Path]; ok {
-			rows = append(rows, dimStyle.Render("  "+hostsLine(hosts, w-2)))
+			sub = hostsLine(hosts, w-2)
 		} else if p.Sessions > 0 {
-			rows = append(rows, dimStyle.Render(fmt.Sprintf("  %d sessions", p.Sessions)))
+			sub = fmt.Sprintf("%d sessions", p.Sessions)
+		}
+		if len(p.Branches) > 0 {
+			brs := []string{}
+			for _, b := range p.Branches {
+				if b.Branch == "" {
+					continue
+				}
+				brs = append(brs, fmt.Sprintf("%s %s", b.Branch, fmtTokens(b.Total())))
+			}
+			if len(brs) > 0 {
+				if sub != "" {
+					sub += " · "
+				}
+				sub += strings.Join(brs, " · ")
+			}
+		}
+		if sub != "" {
+			rows = append(rows, dimStyle.Render("  "+sub))
 		}
 	}
 	if scroll > 0 || end < len(m.ByProject) {
@@ -810,14 +833,14 @@ func viewModels(m merger.Merged, w int) string {
 		if maxT > 0 {
 			ratio = float64(mm.Total()) / float64(maxT) * 100
 		}
-		// Cache savings: cached read tokens cost 10% of normal input.
-		// Approximate saved tokens at 90% of cache_read.
 		saved := int64(float64(mm.CacheR) * 0.9)
 		rows = append(rows,
-			fmt.Sprintf("%-*s %s  %s",
+			fmt.Sprintf("%-*s %s  %s  %s",
 				nameW, truncate(prettyModel(mm.Model), nameW),
 				barNeutral(ratio, barW),
-				pad(fmtTokens(mm.Total()), numW)),
+				pad(fmtTokens(mm.Total()), numW),
+				trendLabel(mm.Total(), mm.PrevTotal()),
+			),
 			dimStyle.Render(fmt.Sprintf("%-*s  in=%s  out=%s  cache_read=%s  cache_create=%s",
 				nameW, "",
 				fmtTokens(mm.In), fmtTokens(mm.Out),
@@ -825,6 +848,11 @@ func viewModels(m merger.Merged, w int) string {
 			dimStyle.Render(fmt.Sprintf("%-*s  cache_hit=%.0f%% (saved ~%s)  sessions=%d",
 				nameW, "", mm.CacheHitRate(), fmtTokens(saved), mm.Sessions)),
 		)
+		if mm.WebSearch > 0 || mm.WebFetch > 0 {
+			rows = append(rows, dimStyle.Render(fmt.Sprintf(
+				"%-*s  web_search=%d  web_fetch=%d",
+				nameW, "", mm.WebSearch, mm.WebFetch)))
+		}
 	}
 	return strings.Join(rows, "\n")
 }
@@ -859,6 +887,92 @@ func viewHosts(m merger.Merged, w int) string {
 		))
 	}
 	return strings.Join(rows, "\n")
+}
+
+// viewHeatmap renders a 7x24 grid (day-of-week × hour-of-day) with cell
+// intensity proportional to tokens. Each cell is a 2-char wide unicode
+// block painted in cyan→magenta as intensity climbs.
+func viewHeatmap(m merger.Merged, w int) string {
+	header := labelStyle.Render("HEATMAP (last 7d · day × hour, all hosts)")
+	var peak int64
+	var total int64
+	var peakDay, peakHour int
+	for i, v := range m.Heatmap {
+		total += v
+		if v > peak {
+			peak = v
+			peakDay = i / 24
+			peakHour = i % 24
+		}
+	}
+	if peak == 0 {
+		return strings.Join([]string{header, "", dimStyle.Render("no transcript data yet")}, "\n")
+	}
+
+	days := []string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
+
+	// Hour header row: print every 2 hours to keep width manageable.
+	var hdr strings.Builder
+	hdr.WriteString("     ")
+	for h := 0; h < 24; h += 2 {
+		hdr.WriteString(fmt.Sprintf("%-4d", h))
+	}
+
+	rows := []string{header, "", dimStyle.Render(hdr.String())}
+	for d := 0; d < 7; d++ {
+		var line strings.Builder
+		line.WriteString(labelStyle.Render(days[d]) + "  ")
+		for h := 0; h < 24; h++ {
+			v := m.Heatmap[d*24+h]
+			cell := heatCell(v, peak)
+			line.WriteString(cell)
+		}
+		rows = append(rows, line.String())
+	}
+	rows = append(rows, "")
+	rows = append(rows, dimStyle.Render(fmt.Sprintf(
+		"total %s · peak %s on %s %02dh",
+		fmtTokens(total), fmtTokens(peak), days[peakDay], peakHour)))
+	return strings.Join(rows, "\n")
+}
+
+func heatCell(v, peak int64) string {
+	if v == 0 || peak == 0 {
+		return dimStyle.Render("░░")
+	}
+	ratio := float64(v) / float64(peak)
+	var ch, color string
+	switch {
+	case ratio >= 0.75:
+		ch = "██"
+		color = "198" // magenta
+	case ratio >= 0.50:
+		ch = "▓▓"
+		color = "205"
+	case ratio >= 0.25:
+		ch = "▒▒"
+		color = "39" // cyan
+	default:
+		ch = "░░"
+		color = "245"
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(ch)
+}
+
+// trendLabel returns a colored "↑+23%" / "↓-15%" / "·" label.
+func trendLabel(curr, prev int64) string {
+	if prev == 0 {
+		return dimStyle.Render(" new ")
+	}
+	pct := domain.TrendPct(curr, prev)
+	switch {
+	case pct > 5:
+		return okStyle.Render(fmt.Sprintf("↑%2.0f%%", pct))
+	case pct < -5:
+		return errStyle.Render(fmt.Sprintf("↓%2.0f%%", -pct))
+	default:
+		return dimStyle.Render("  ·  ")
+	}
 }
 
 // viewSessions renders the top N most expensive sessions in the window.

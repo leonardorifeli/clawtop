@@ -1,0 +1,10 @@
+[Unit]
+Description=clawtop daily archive of /var/lib/clawtop machine snapshots
+ConditionPathExists=/var/lib/clawtop
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/clawtop-backup.sh
+
+[Install]
+WantedBy=default.target
