@@ -202,6 +202,9 @@ func Merge(parts []domain.Status) Merged {
 	}
 
 	for _, v := range projects {
+		if v.Total() == 0 {
+			continue // skip projects with no token usage in this window
+		}
 		out.ByProject = append(out.ByProject, *v)
 	}
 	sort.Slice(out.ByProject, func(i, j int) bool {
