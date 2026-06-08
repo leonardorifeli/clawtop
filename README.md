@@ -108,22 +108,26 @@ common gotchas around SSH alias users and copy-pasted long URLs) is in
 
 Six tabs, or one dense dashboard view (default when terminal is ≥80×18):
 
-1. **Limits** — 5h and 7d rate-limit windows with reset countdowns.
+1. **Limits** — 5h and 7d rate-limit windows with reset countdowns, burn-rate
+   projection, and a **day-over-day delta** (↑/↓ pp vs ~24h ago) once the
+   daemon has built up local history.
 2. **Projects** — which working directories ate your token budget over
    the chosen window; per-host attribution when two or more machines
    contributed to the same project; session count per project.
 3. **Models** — Opus vs Sonnet vs Haiku split, input/output/cache
    columns, **cache hit rate**, distinct session count per model, and an
-   **estimated USD cost** per model and overall (list price — override with
-   `--pricing`).
+   **estimated USD cost** per model, overall, and as a **~$/month run rate**
+   (list price — override with `--pricing`).
 4. **Hosts** — per-machine totals: tokens contributed, distinct
    projects, distinct sessions, freshness.
 5. **Sessions** — top 10 most expensive conversations in the window, each
    with its **AI title** (what it was actually about), a **live dot** for
    sessions touched in the last 5 minutes, per-session **cache hit rate**,
-   and an **action breakdown** (edits, files touched, reads, bash) so you
-   see what was done, not just how many tokens it cost. Account-level
-   edit/read/bash totals sit in the section header.
+   **estimated cost**, and an **action breakdown** (edits, files touched,
+   reads, bash) so you see what was done, not just how many tokens it cost.
+   A **⚠ flag** marks sessions that burned tokens but produced no output
+   (no edits/files/bash — usually the model spinning). Account-level
+   edit/read/bash totals and a live-session count sit in the headers.
 6. **Hourly** — 24h sparkline plus 7d daily breakdown.
 
 Press `f` to filter to a single host (cycles through all → omen → pop-os
@@ -216,10 +220,38 @@ attacker gets numbers, not the OAuth token.
 | `--once` | `false` | probe once and exit (smoke test) |
 | `--local-only` | `false` | print to stdout instead of writing |
 | `--skip-probe` | `false` | skip the Anthropic call, aggregate transcripts only |
+| `--alert-session` | `0` (off) | alert when the 5h window reaches this percent |
+| `--alert-week` | `0` (off) | alert when the 7d window reaches this percent |
+| `--alert-project` | `false` | alert when burn rate projects hitting 100% before reset |
+| `--notify-url` | "" | POST alerts to this URL (ntfy topic or generic webhook) |
+| `--notify-cmd` | "" | run this command (`sh -c`) per alert; details in `$CLAWTOP_ALERT_*` |
+| `--history-dir` | `~/.local/share/clawtop` | local rate-limit history dir (empty disables) |
+| `--history-keep` | `720h` (30d) | how long to retain history samples |
 
 `clawtopd doctor` accepts the same flags and runs four preflight checks:
 credentials are readable, Anthropic responds, SSH alias is reachable
 (if remote), destination is writable.
+
+### Alerts
+
+The daemon can notify you before you hit a wall, so you don't have to watch
+the TUI. Alerts **edge-trigger** — each condition fires once when it starts,
+then re-arms only after it clears (e.g. the window resets). Every alert is
+logged; set `--notify-url` and/or `--notify-cmd` to also push it out.
+
+```bash
+# Warn at 80% session / 90% week, and when burn rate projects an overrun,
+# pushing to an ntfy topic and a desktop notification.
+clawtopd --alert-session=80 --alert-week=90 --alert-project \
+  --notify-url=https://ntfy.sh/my-private-topic \
+  --notify-cmd='notify-send "$CLAWTOP_ALERT_TITLE" "$CLAWTOP_ALERT_MESSAGE"'
+```
+
+`--notify-cmd` runs with `$CLAWTOP_ALERT_TITLE`, `$CLAWTOP_ALERT_MESSAGE`,
+`$CLAWTOP_ALERT_LEVEL` (warning/urgent), and `$CLAWTOP_ALERT_KEY` set.
+History is local daemon state; the derived day-over-day deltas travel to the
+viewer inside the status payload, so a central viewer shows them without
+reading any history file.
 
 `clawtop` (viewer):
 
@@ -251,8 +283,9 @@ quit.
   "schema": 5,
   "machine": "omen",
   "ts": 1716688320,
-  "session": { "pct": 31.0, "reset_at": 1716700000 },
-  "week":    { "pct":  5.0, "reset_at": 1717100000 },
+  "session": { "pct": 31.0, "reset_at": 1716700000, "prev_day_pct": 22.0 },
+  "week":    { "pct":  5.0, "reset_at": 1717100000, "prev_day_pct":  4.0 },
+  "has_history": true,
   "limit":   "allowed",
   "subscription": "team",
   "window":  "7d",

@@ -13,7 +13,13 @@ const Version = 5
 type Window struct {
 	Pct     float64 `json:"pct"`
 	ResetAt int64   `json:"reset_at"`
+	// PrevDayPct is this window's utilization ~24h ago, from local history.
+	// Zero (and HasHistory false on Status) when no sample is old enough yet.
+	PrevDayPct float64 `json:"prev_day_pct,omitempty"`
 }
+
+// DayDelta returns the percentage-point change vs ~24h ago.
+func (w Window) DayDelta() float64 { return w.Pct - w.PrevDayPct }
 
 // BranchStat captures token usage for a (project, git-branch) pair.
 type BranchStat struct {
@@ -65,6 +71,9 @@ type Status struct {
 	TS           int64         `json:"ts"`
 	Session      Window        `json:"session"`
 	Week         Window        `json:"week"`
+	// HasHistory is true once the daemon has enough local history to populate
+	// the PrevDayPct fields (i.e. a sample from ~24h ago exists).
+	HasHistory bool `json:"has_history,omitempty"`
 	Limit        string        `json:"limit"`
 	Subscription string        `json:"subscription"`
 	Window       string        `json:"window"`

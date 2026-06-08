@@ -15,6 +15,7 @@ type Merged struct {
 	TS           int64
 	Session      domain.Window
 	Week         domain.Window
+	HasHistory   bool
 	Limit        string
 	Subscription string
 	Window       string
@@ -73,6 +74,7 @@ func Merge(parts []domain.Status) Merged {
 	out.TS = f.TS
 	out.Session = f.Session
 	out.Week = f.Week
+	out.HasHistory = f.HasHistory
 	out.Limit = f.Limit
 	out.Subscription = f.Subscription
 	out.Window = f.Window

@@ -28,8 +28,40 @@ import (
 	"github.com/leonardorifeli/clawtop/external/anthropic"
 	"github.com/leonardorifeli/clawtop/external/push"
 	"github.com/leonardorifeli/clawtop/internal/domain"
+	"github.com/leonardorifeli/clawtop/internal/service/alert"
 	"github.com/leonardorifeli/clawtop/internal/service/collector"
+	"github.com/leonardorifeli/clawtop/internal/service/history"
 )
+
+// limitSample records one observation of the rate-limit windows, for deriving
+// a burn rate to feed the alert projection.
+type limitSample struct {
+	at   time.Time
+	sess float64
+	week float64
+}
+
+// burnRate returns percent-per-hour for session and week from the sample
+// history. Returns 0,0 until there are two distinct-time samples; a window
+// reset (negative delta) is floored to 0 so it never reads as negative burn.
+func burnRate(h []limitSample) (sessRate, weekRate float64) {
+	if len(h) < 2 {
+		return 0, 0
+	}
+	first, last := h[0], h[len(h)-1]
+	dt := last.at.Sub(first.at).Hours()
+	if dt <= 0 {
+		return 0, 0
+	}
+	ds, dw := last.sess-first.sess, last.week-first.week
+	if ds < 0 {
+		ds = 0
+	}
+	if dw < 0 {
+		dw = 0
+	}
+	return ds / dt, dw / dt
+}
 
 var safeID = regexp.MustCompile(`[^a-zA-Z0-9_.-]+`)
 
@@ -79,6 +111,13 @@ type runConfig struct {
 	once         bool
 	localOnly    bool
 	skipProbe    bool
+	alertSession float64
+	alertWeek    float64
+	alertProject bool
+	notifyURL    string
+	notifyCmd    string
+	historyDir   string
+	historyKeep  time.Duration
 }
 
 func parseRunFlags(args []string) *runConfig {
@@ -97,6 +136,14 @@ func parseRunFlags(args []string) *runConfig {
 	fs.BoolVar(&cfg.once, "once", false, "probe once and exit (useful for testing)")
 	fs.BoolVar(&cfg.localOnly, "local-only", false, "do not push; print status JSON to stdout")
 	fs.BoolVar(&cfg.skipProbe, "skip-probe", false, "do not call Anthropic; aggregate transcripts only")
+	fs.Float64Var(&cfg.alertSession, "alert-session", 0, "alert when the 5h session window reaches this percent (0 = off)")
+	fs.Float64Var(&cfg.alertWeek, "alert-week", 0, "alert when the 7d week window reaches this percent (0 = off)")
+	fs.BoolVar(&cfg.alertProject, "alert-project", false, "alert when burn rate projects hitting 100% before the window resets")
+	fs.StringVar(&cfg.notifyURL, "notify-url", "", "POST alerts to this URL (ntfy topic or generic webhook)")
+	fs.StringVar(&cfg.notifyCmd, "notify-cmd", "", "run this command (via sh -c) per alert; details in $CLAWTOP_ALERT_* env vars")
+	defaultHistory := filepath.Join(os.Getenv("HOME"), ".local", "share", "clawtop")
+	fs.StringVar(&cfg.historyDir, "history-dir", defaultHistory, "local directory for rate-limit history (empty = disabled); used to report day-over-day deltas")
+	fs.DurationVar(&cfg.historyKeep, "history-keep", 30*24*time.Hour, "how long to retain history samples")
 	_ = fs.Parse(args)
 
 	if cfg.dir == "" {
@@ -109,6 +156,7 @@ func parseRunFlags(args []string) *runConfig {
 	cfg.dir = expandHome(cfg.dir)
 	cfg.credsPath = expandHome(cfg.credsPath)
 	cfg.projectsRoot = expandHome(cfg.projectsRoot)
+	cfg.historyDir = expandHome(cfg.historyDir)
 	if cfg.machineID == "" {
 		log.Fatal("--machine required when hostname is empty")
 	}
@@ -156,6 +204,27 @@ func runDaemon(args []string) {
 	// Transcript aggregation always runs from fresh, since it is local I/O.
 	var lastProbed *domain.Status
 
+	// Alerting: derive a burn rate from a small rolling sample history and
+	// edge-trigger notifications. Nil notifier when no alert flag is set.
+	var samples []limitSample
+	var notifier *alert.Notifier
+	alertCfg := alert.Config{SessionPct: cfg.alertSession, WeekPct: cfg.alertWeek, Project: cfg.alertProject}
+	if alertCfg.Enabled() {
+		notifier = alert.New(alertCfg, cfg.notifyURL, cfg.notifyCmd, log.Printf)
+	}
+
+	// Rate-limit history: local state used to report day-over-day deltas.
+	// Prune once at startup so it stays bounded across restarts.
+	hist, err := history.New(cfg.historyDir, cfg.machineID)
+	if err != nil {
+		log.Printf("history: %v (disabled)", err)
+	}
+	if hist != nil {
+		if err := hist.Prune(time.Now(), cfg.historyKeep); err != nil {
+			log.Printf("history prune: %v", err)
+		}
+	}
+
 	run := func() {
 		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
@@ -183,6 +252,35 @@ func runDaemon(args []string) {
 				s.Limit = probed.Limit
 				s.Subscription = probed.Subscription
 				lastProbed = probed
+			}
+		}
+
+		// Evaluate alerts from the rate-limit windows (independent of the
+		// transcript aggregation below). Skip when both pcts are zero — a
+		// failed first probe with no last-known-good has nothing to project.
+		if notifier != nil && (s.Session.Pct > 0 || s.Week.Pct > 0) {
+			samples = append(samples, limitSample{at: time.Now(), sess: s.Session.Pct, week: s.Week.Pct})
+			if len(samples) > 30 {
+				samples = samples[len(samples)-30:]
+			}
+			sr, wr := burnRate(samples)
+			notifier.Process([]alert.Window{
+				{Name: "session", Pct: s.Session.Pct, ResetIn: s.Session.ResetIn(), Rate: sr},
+				{Name: "week", Pct: s.Week.Pct, ResetIn: s.Week.ResetIn(), Rate: wr},
+			})
+		}
+
+		// Record history and report the ~24h-ago values as deltas in the
+		// payload, so viewers show day-over-day trend without reading the file.
+		if hist != nil && (s.Session.Pct > 0 || s.Week.Pct > 0) {
+			now := time.Now()
+			if err := hist.Append(now.Unix(), s.Session.Pct, s.Week.Pct); err != nil {
+				log.Printf("history append: %v", err)
+			}
+			if prev, ok := hist.At(now, 24*time.Hour); ok {
+				s.Session.PrevDayPct = prev.Sess
+				s.Week.PrevDayPct = prev.Week
+				s.HasHistory = true
 			}
 		}
 

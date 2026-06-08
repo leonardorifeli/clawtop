@@ -94,6 +94,16 @@ func (t pricingTable) modelCost(m domain.Model) (float64, bool) {
 	return p.Cost(m.In, m.Out, m.CacheR, m.CacheC), true
 }
 
+// sessionCost estimates the USD cost of one session's usage. ok is false when
+// the session's model family is unknown to the table.
+func (t pricingTable) sessionCost(s domain.SessionStat) (float64, bool) {
+	p, ok := t.priceFor(s.Model)
+	if !ok {
+		return 0, false
+	}
+	return p.Cost(s.In, s.Out, s.CacheR, s.CacheC), true
+}
+
 // totalCost sums the estimated cost across all models with a known family.
 func (t pricingTable) totalCost(models []domain.Model) float64 {
 	var sum float64
