@@ -247,8 +247,23 @@ clawtopd --alert-session=80 --alert-week=90 --alert-project \
   --notify-cmd='notify-send "$CLAWTOP_ALERT_TITLE" "$CLAWTOP_ALERT_MESSAGE"'
 ```
 
-`--notify-cmd` runs with `$CLAWTOP_ALERT_TITLE`, `$CLAWTOP_ALERT_MESSAGE`,
-`$CLAWTOP_ALERT_LEVEL` (warning/urgent), and `$CLAWTOP_ALERT_KEY` set.
+`--notify-cmd` is the generic hook: point it at your own script to route
+alerts anywhere — Slack, a self-hosted messaging gateway, a pager — without
+clawtop needing to know about that channel. How it arrives: on each firing
+alert (after the edge-trigger), `clawtopd` spawns the command once via
+`sh -c`, passing the alert through environment variables — it does not write
+to the command's stdin. Your script reads:
+
+| env var | value |
+|---------|-------|
+| `$CLAWTOP_ALERT_TITLE` | short headline, e.g. `clawtop: week at 92%` |
+| `$CLAWTOP_ALERT_MESSAGE` | full text with pct, threshold/projection, reset countdown |
+| `$CLAWTOP_ALERT_LEVEL` | `warning` or `urgent` |
+| `$CLAWTOP_ALERT_KEY` | stable id, e.g. `week:threshold` (handy for dedup/routing) |
+
+`--notify-url`, by contrast, needs no script: `clawtopd` POSTs the message as
+the request body with `Title`/`Priority` headers (ntfy-shaped).
+
 History is local daemon state; the derived day-over-day deltas travel to the
 viewer inside the status payload, so a central viewer shows them without
 reading any history file.
