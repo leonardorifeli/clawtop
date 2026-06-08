@@ -7,7 +7,7 @@ package domain
 import "time"
 
 // Schema version. Bump when making a breaking change.
-const Version = 4
+const Version = 5
 
 // Window represents a rate-limit window (e.g. 5h session or 7d weekly).
 type Window struct {
@@ -81,6 +81,11 @@ type Status struct {
 	// Web tool counters at account level (also broken down per-model).
 	WebSearch int64 `json:"web_search"`
 	WebFetch  int64 `json:"web_fetch"`
+	// Tool-action counters at account level over the window: how much real
+	// work happened (edits/reads/shell commands), independent of token spend.
+	Edits int64 `json:"edits"`
+	Reads int64 `json:"reads"`
+	Bash  int64 `json:"bash"`
 }
 
 // SessionStat summarizes a single Claude conversation worth of tokens.
@@ -90,11 +95,31 @@ type SessionStat struct {
 	Model     string `json:"model"`
 	In        int64  `json:"in"`
 	Out       int64  `json:"out"`
+	CacheR    int64  `json:"cache_read"`
+	CacheC    int64  `json:"cache_create"`
 	StartedAt int64  `json:"started_at"`
 	LastAt    int64  `json:"last_at"`
+	// Title is the human-readable session title (Claude Code's ai-title,
+	// falling back to a truncated last prompt). Empty when neither is present.
+	Title string `json:"title,omitempty"`
+	// Tool-action counters: what the session actually did, not just its tokens.
+	Edits        int `json:"edits"`         // Edit/Write/MultiEdit/NotebookEdit calls
+	Reads        int `json:"reads"`         // Read/Glob/Grep calls
+	Bash         int `json:"bash"`          // Bash calls
+	FilesTouched int `json:"files_touched"` // distinct file paths edited/written
 }
 
 func (s SessionStat) Total() int64 { return s.In + s.Out }
+
+// CacheHitRate returns the fraction of input tokens served from cache for this
+// session, in [0, 100]. Zero when no input tokens at all.
+func (s SessionStat) CacheHitRate() float64 {
+	denom := s.In + s.CacheR
+	if denom == 0 {
+		return 0
+	}
+	return float64(s.CacheR) / float64(denom) * 100
+}
 
 func (s Status) Age() time.Duration {
 	return time.Since(time.Unix(s.TS, 0))

@@ -38,6 +38,9 @@ type Result struct {
 	Heatmap     [168]int64
 	WebSearch   int64
 	WebFetch    int64
+	Edits       int64
+	Reads       int64
+	Bash        int64
 }
 
 type entry struct {
@@ -56,9 +59,41 @@ type entry struct {
 				WebFetchRequests  int64 `json:"web_fetch_requests"`
 			} `json:"server_tool_use"`
 		} `json:"usage"`
+		// Content is left raw: assistant turns carry an array of blocks,
+		// other roles carry a plain string. We decode it lazily only for
+		// assistant entries, so a string value never breaks the outer parse.
+		Content json.RawMessage `json:"content"`
 	} `json:"message"`
-	SessionID string `json:"sessionId"`
-	Timestamp string `json:"timestamp"`
+	SessionID  string `json:"sessionId"`
+	Timestamp  string `json:"timestamp"`
+	AITitle    string `json:"aiTitle"`    // on "ai-title" entries
+	LastPrompt string `json:"lastPrompt"` // on "last-prompt" entries
+}
+
+// contentBlock is a single block of an assistant message. We only care about
+// tool_use blocks: their name tells us what action was taken and, for edit
+// tools, input.file_path tells us which file.
+type contentBlock struct {
+	Type  string `json:"type"`
+	Name  string `json:"name"`
+	Input struct {
+		FilePath string `json:"file_path"`
+	} `json:"input"`
+}
+
+// toolKind classifies a tool name into an action bucket. Unknown tools (the
+// many MCP/server tools) fall through to "" and are ignored.
+func toolKind(name string) string {
+	switch name {
+	case "Edit", "Write", "MultiEdit", "NotebookEdit":
+		return "edit"
+	case "Read", "Glob", "Grep":
+		return "read"
+	case "Bash":
+		return "bash"
+	default:
+		return ""
+	}
 }
 
 // branchKey: project path + "\x00" + branch name. Null byte is safe since
@@ -76,12 +111,18 @@ type state struct {
 	webFetch       int64
 	sessionCWD     map[string]string
 	sessionBranch  map[string]string
+	sessionTitle   map[string]string
+	sessionPrompt  map[string]string
+	sessionFiles   map[string]map[string]struct{} // distinct files edited per session
 	projSessions   map[string]map[string]struct{}
 	modelSessions  map[string]map[string]struct{}
 	allSessions    map[string]struct{}
 	sessAgg        map[string]*domain.SessionStat
 	branches       map[string]*domain.BranchStat // key = branchKey(path, branch)
 	branchSessions map[string]map[string]struct{}
+	edits          int64
+	reads          int64
+	bash           int64
 	cutoff         time.Time
 	prevCutoff     time.Time // start of the previous comparison window
 	dayAgo         time.Time
@@ -97,6 +138,9 @@ func newState(opts Options) *state {
 		daily:          make([]int64, 7),
 		sessionCWD:     map[string]string{},
 		sessionBranch:  map[string]string{},
+		sessionTitle:   map[string]string{},
+		sessionPrompt:  map[string]string{},
+		sessionFiles:   map[string]map[string]struct{}{},
 		projSessions:   map[string]map[string]struct{}{},
 		modelSessions:  map[string]map[string]struct{}{},
 		allSessions:    map[string]struct{}{},
@@ -170,6 +214,17 @@ func Collect(opts Options) (*Result, error) {
 		}
 	}
 
+	// Stamp title (ai-title, else truncated last prompt) and distinct
+	// files-touched count onto each session aggregate.
+	for id, sa := range s.sessAgg {
+		if t := s.sessionTitle[id]; t != "" {
+			sa.Title = t
+		} else if pr := s.sessionPrompt[id]; pr != "" {
+			sa.Title = truncatePrompt(pr, 80)
+		}
+		sa.FilesTouched = len(s.sessionFiles[id])
+	}
+
 	return &Result{
 		ByProject:   sortProjects(s.projects),
 		ByModel:     sortModels(s.models),
@@ -180,7 +235,24 @@ func Collect(opts Options) (*Result, error) {
 		Heatmap:     s.heatmap,
 		WebSearch:   s.webSearch,
 		WebFetch:    s.webFetch,
+		Edits:       s.edits,
+		Reads:       s.reads,
+		Bash:        s.bash,
 	}, nil
+}
+
+// truncatePrompt collapses whitespace in a raw prompt and clips it to w runes,
+// so a multi-line last prompt renders as a single tidy title line.
+func truncatePrompt(s string, w int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) <= w {
+		return s
+	}
+	if w < 1 {
+		return ""
+	}
+	return string(r[:w-1]) + "…"
 }
 
 type pendingEntry struct {
@@ -191,7 +263,11 @@ type pendingEntry struct {
 	cacheC  int64
 	webSearch int64
 	webFetch  int64
-	ts      time.Time
+	edits     int
+	reads     int
+	bash      int
+	files     []string // distinct file paths edited in this entry
+	ts        time.Time
 }
 
 func (s *state) scanFile(f *os.File) {
@@ -208,7 +284,9 @@ func (s *state) scanFile(f *os.File) {
 			continue
 		}
 
-		// Capture cwd + branch the first time we see them for a session.
+		// Capture cwd + branch the first time we see them for a session, and
+		// the title/prompt whenever they appear (latest wins — Claude Code
+		// rewrites the ai-title as the conversation evolves).
 		if e.SessionID != "" {
 			if e.CWD != "" {
 				if _, ok := s.sessionCWD[e.SessionID]; !ok {
@@ -219,6 +297,12 @@ func (s *state) scanFile(f *os.File) {
 				if _, ok := s.sessionBranch[e.SessionID]; !ok {
 					s.sessionBranch[e.SessionID] = e.GitBranch
 				}
+			}
+			if e.AITitle != "" {
+				s.sessionTitle[e.SessionID] = e.AITitle
+			}
+			if e.LastPrompt != "" {
+				s.sessionPrompt[e.SessionID] = e.LastPrompt
 			}
 		}
 
@@ -240,6 +324,28 @@ func (s *state) scanFile(f *os.File) {
 			webSearch: e.Message.Usage.ServerToolUse.WebSearchRequests,
 			webFetch:  e.Message.Usage.ServerToolUse.WebFetchRequests,
 			ts:        ts,
+		}
+
+		// Count tool actions from the assistant message's content blocks.
+		// Errors (e.g. a string content) are ignored — blocks stays empty.
+		var blocks []contentBlock
+		if json.Unmarshal(e.Message.Content, &blocks) == nil {
+			for _, b := range blocks {
+				if b.Type != "tool_use" {
+					continue
+				}
+				switch toolKind(b.Name) {
+				case "edit":
+					p.edits++
+					if b.Input.FilePath != "" {
+						p.files = append(p.files, b.Input.FilePath)
+					}
+				case "read":
+					p.reads++
+				case "bash":
+					p.bash++
+				}
+			}
 		}
 
 		cwd, ok := s.sessionCWD[p.session]
@@ -304,6 +410,9 @@ func (s *state) apply(p pendingEntry, cwd string) {
 	if inCurr {
 		s.webSearch += p.webSearch
 		s.webFetch += p.webFetch
+		s.edits += int64(p.edits)
+		s.reads += int64(p.reads)
+		s.bash += int64(p.bash)
 	}
 
 	if p.session != "" && inCurr {
@@ -347,6 +456,19 @@ func (s *state) apply(p pendingEntry, cwd string) {
 		}
 		sa.In += p.in
 		sa.Out += p.out
+		sa.CacheR += p.cacheR
+		sa.CacheC += p.cacheC
+		sa.Edits += p.edits
+		sa.Reads += p.reads
+		sa.Bash += p.bash
+		for _, f := range p.files {
+			set := s.sessionFiles[p.session]
+			if set == nil {
+				set = map[string]struct{}{}
+				s.sessionFiles[p.session] = set
+			}
+			set[f] = struct{}{}
+		}
 		if ts < sa.StartedAt {
 			sa.StartedAt = ts
 		}

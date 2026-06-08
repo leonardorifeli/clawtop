@@ -26,6 +26,9 @@ type Merged struct {
 	Heatmap      [168]int64
 	WebSearch    int64
 	WebFetch     int64
+	Edits        int64
+	Reads        int64
+	Bash         int64
 	TopSessions  []domain.SessionStat
 
 	// HostsByProject[projectPath] -> list of (host, in, out) contributions,
@@ -95,6 +98,9 @@ func Merge(parts []domain.Status) Merged {
 		out.Sessions += p.Sessions
 		out.WebSearch += p.WebSearch
 		out.WebFetch += p.WebFetch
+		out.Edits += p.Edits
+		out.Reads += p.Reads
+		out.Bash += p.Bash
 
 		for _, pj := range p.ByProject {
 			key := pj.Path

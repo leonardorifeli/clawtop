@@ -40,10 +40,11 @@ func main() {
 	var (
 		dir     = flag.String("dir", "/var/lib/clawtop", "directory containing per-machine status JSON files")
 		machine = flag.String("machine", "", "show only this machine (filename without .json); empty = show all merged")
+		pricing = flag.String("pricing", "", "optional JSON file overriding the built-in per-million-token USD price estimates")
 	)
 	flag.Parse()
 
-	p := tea.NewProgram(initialModel(expandHome(*dir), *machine), tea.WithAltScreen())
+	p := tea.NewProgram(initialModel(expandHome(*dir), *machine, loadPricing(expandHome(*pricing))), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -83,6 +84,7 @@ type model struct {
 	forceDashboard  bool
 	scrollProjects  int
 	history         []probeSample // last ~20 probes, for burn-rate calc
+	pricing         pricingTable  // per-million-token USD estimates
 }
 
 // probeSample records one observation of the rate-limit windows over time.
@@ -95,8 +97,8 @@ type probeSample struct {
 
 const historyKeep = 30 // ~30 minutes at 1 sample/min equivalent
 
-func initialModel(dir, filter string) model {
-	m := model{dir: dir, machineFilter: filter}
+func initialModel(dir, filter string, pricing pricingTable) model {
+	m := model{dir: dir, machineFilter: filter, pricing: pricing}
 	m.reload()
 	return m
 }
@@ -394,7 +396,7 @@ func (m model) viewDashboard() string {
 	}
 	visible := m.projectsVisible()
 	leftCol := dashboardProjects(merged, leftW, visible, m.scrollProjects)
-	rightCol := dashboardModels(merged, rightW)
+	rightCol := dashboardModels(merged, rightW, m.pricing)
 	cols := lipgloss.JoinHorizontal(lipgloss.Top, leftCol, "  ", rightCol)
 
 	hosts := dashboardHosts(merged, innerW)
@@ -420,12 +422,19 @@ func (m model) viewDashboard() string {
 	return padding.Render(body)
 }
 
-// dashboardSessions is a compact 4-line view of the top 3 most expensive
-// sessions in the window.
+// dashboardSessions is a compact view of the top 3 most expensive sessions in
+// the window: live dot + title, with tokens/actions/model/age as dim meta.
 func dashboardSessions(m merger.Merged, w int) string {
 	header := labelStyle.Render("TOP SESSIONS")
+	if a := actionsSummary(m); a != "" {
+		header += dimStyle.Render(" · " + a)
+	}
 	if len(m.TopSessions) == 0 {
 		return header + " " + dimStyle.Render("none")
+	}
+	labelW := w * 40 / 100
+	if labelW < 16 {
+		labelW = 16
 	}
 	rows := []string{header}
 	now := time.Now()
@@ -433,12 +442,19 @@ func dashboardSessions(m merger.Merged, w int) string {
 		if i >= 3 {
 			break
 		}
-		age := now.Sub(time.Unix(s.LastAt, 0))
-		rows = append(rows, fmt.Sprintf("  %-22s %-12s %s · %s ago",
-			truncate(s.Project, 22),
-			pad(fmtTokens(s.Total()), 8),
-			dimStyle.Render(truncate(prettyModel(s.Model), 14)),
-			dimStyle.Render(short(age)),
+		label := s.Title
+		if label == "" {
+			label = s.Project
+		}
+		meta := []string{fmtTokens(s.Total())}
+		if act := sessionActions(s); act != "" {
+			meta = append(meta, act)
+		}
+		meta = append(meta, prettyModel(s.Model), short(now.Sub(time.Unix(s.LastAt, 0)))+" ago")
+		rows = append(rows, fmt.Sprintf("  %s %-*s %s",
+			liveDot(s.LastAt),
+			labelW, truncate(label, labelW),
+			dimStyle.Render(truncate(strings.Join(meta, " · "), w-labelW-5)),
 		))
 	}
 	return strings.Join(rows, "\n")
@@ -629,21 +645,28 @@ func dashboardProjects(m merger.Merged, w, visible, scroll int) string {
 	return strings.Join(rows, "\n")
 }
 
-func dashboardModels(m merger.Merged, w int) string {
+func dashboardModels(m merger.Merged, w int, pricing pricingTable) string {
 	header := labelStyle.Render("MODELS")
+	if total := pricing.totalCost(m.ByModel); total > 0 {
+		header += dimStyle.Render(" · est. " + fmtUSD(total))
+	}
 	if len(m.ByModel) == 0 {
 		return strings.Join([]string{header, dimStyle.Render("no data")}, "\n")
 	}
 	rows := []string{header}
 	for _, mm := range m.ByModel {
 		nameW := w - 11
+		costStr := ""
+		if c, ok := pricing.modelCost(mm); ok {
+			costStr = " · " + fmtUSD(c)
+		}
 		rows = append(rows,
 			fmt.Sprintf("%-*s %s",
 				nameW, truncate(prettyModel(mm.Model), nameW),
 				pad(fmtTokens(mm.Total()), 9)),
-			dimStyle.Render(fmt.Sprintf("  in %s · out %s · cache %.0f%% (saved ~%s) · %d sess",
+			dimStyle.Render(fmt.Sprintf("  in %s · out %s · cache %.0f%% (saved ~%s) · %d sess%s",
 				fmtTokens(mm.In), fmtTokens(mm.Out), mm.CacheHitRate(),
-				fmtTokens(int64(float64(mm.CacheR)*0.9)), mm.Sessions)),
+				fmtTokens(int64(float64(mm.CacheR)*0.9)), mm.Sessions, costStr)),
 		)
 	}
 	return strings.Join(rows, "\n")
@@ -668,7 +691,7 @@ func (m model) viewTabbed() string {
 	case tabProjects:
 		body = viewProjects(m.merged, innerW, m.projectsVisible(), m.scrollProjects)
 	case tabModels:
-		body = viewModels(m.merged, innerW)
+		body = viewModels(m.merged, innerW, m.pricing)
 	case tabHosts:
 		body = viewHosts(m.merged, innerW)
 	case tabSessions:
@@ -810,11 +833,14 @@ func viewProjects(m merger.Merged, w, visible, scroll int) string {
 	return strings.Join(rows, "\n")
 }
 
-func viewModels(m merger.Merged, w int) string {
+func viewModels(m merger.Merged, w int, pricing pricingTable) string {
 	if len(m.ByModel) == 0 {
 		return dimStyle.Render("no transcript data yet")
 	}
 	header := labelStyle.Render(fmt.Sprintf("MODELS (last %s)", fallback(m.Window, "?")))
+	if total := pricing.totalCost(m.ByModel); total > 0 {
+		header += dimStyle.Render("   est. " + fmtUSD(total) + " (list price, validate against billing)")
+	}
 	var maxT int64
 	for _, mm := range m.ByModel {
 		if mm.Total() > maxT {
@@ -845,8 +871,8 @@ func viewModels(m merger.Merged, w int) string {
 				nameW, "",
 				fmtTokens(mm.In), fmtTokens(mm.Out),
 				fmtTokens(mm.CacheR), fmtTokens(mm.CacheC))),
-			dimStyle.Render(fmt.Sprintf("%-*s  cache_hit=%.0f%% (saved ~%s)  sessions=%d",
-				nameW, "", mm.CacheHitRate(), fmtTokens(saved), mm.Sessions)),
+			dimStyle.Render(fmt.Sprintf("%-*s  cache_hit=%.0f%% (saved ~%s)  sessions=%d%s",
+				nameW, "", mm.CacheHitRate(), fmtTokens(saved), mm.Sessions, modelCostSuffix(pricing, mm))),
 		)
 		if mm.WebSearch > 0 || mm.WebFetch > 0 {
 			rows = append(rows, dimStyle.Render(fmt.Sprintf(
@@ -975,28 +1001,43 @@ func trendLabel(curr, prev int64) string {
 	}
 }
 
-// viewSessions renders the top N most expensive sessions in the window.
-// Useful to spot runaway conversations and which project they belonged to.
+// viewSessions renders the top N most expensive sessions in the window. Each
+// session takes two lines: a live-dot + title headline, then a dim meta line
+// with project, model, tokens, cache hit rate, action breakdown, duration and
+// last-seen. Useful to spot what each runaway conversation was actually doing.
 func viewSessions(m merger.Merged, w int) string {
 	header := labelStyle.Render(fmt.Sprintf("TOP SESSIONS (last %s)", fallback(m.Window, "?")))
+	if a := actionsSummary(m); a != "" {
+		header += dimStyle.Render(" · " + a)
+	}
 	if len(m.TopSessions) == 0 {
 		return strings.Join([]string{header, "", dimStyle.Render("no transcript data yet")}, "\n")
 	}
-	rows := []string{header, "",
-		dimStyle.Render(fmt.Sprintf("%-22s %-18s %-10s %-10s %s",
-			"project", "model", "tokens", "duration", "last seen")),
-	}
+	rows := []string{header, "", dimStyle.Render("● live (touched <5m)   actions: e=edits f=files r=reads b=bash"), ""}
 	now := time.Now()
 	for _, s := range m.TopSessions {
 		dur := time.Duration(s.LastAt-s.StartedAt) * time.Second
 		age := now.Sub(time.Unix(s.LastAt, 0))
-		rows = append(rows, fmt.Sprintf("%-22s %-18s %-10s %-10s %s ago",
-			truncate(s.Project, 22),
-			truncate(prettyModel(s.Model), 18),
+		label := s.Title
+		if label == "" {
+			label = s.Project
+		}
+		meta := []string{
+			truncate(s.Project, 20),
+			truncate(prettyModel(s.Model), 16),
 			fmtTokens(s.Total()),
-			short(dur),
-			short(age),
-		))
+		}
+		if s.In+s.CacheR > 0 {
+			meta = append(meta, fmt.Sprintf("cache %.0f%%", s.CacheHitRate()))
+		}
+		if act := sessionActions(s); act != "" {
+			meta = append(meta, act)
+		}
+		meta = append(meta, short(dur), short(age)+" ago")
+		rows = append(rows,
+			fmt.Sprintf("%s %s", liveDot(s.LastAt), truncate(label, w-2)),
+			dimStyle.Render("  "+truncate(strings.Join(meta, " · "), w-2)),
+		)
 	}
 	return strings.Join(rows, "\n")
 }
@@ -1120,6 +1161,53 @@ func sparkline(values []int64, width int) string {
 
 func pct(v float64) string {
 	return pctStyle.Render(fmt.Sprintf("%5.1f%%", v))
+}
+
+// liveDot returns a green ● for sessions touched within the last 5 minutes
+// (still active), else a dim ○ (idle/done).
+func liveDot(lastAt int64) string {
+	if lastAt > 0 && time.Since(time.Unix(lastAt, 0)) < 5*time.Minute {
+		return okStyle.Render("●")
+	}
+	return dimStyle.Render("○")
+}
+
+// actionsSummary renders account-level edits/reads/bash compactly. Empty when
+// all are zero (e.g. an older daemon that didn't report them).
+func actionsSummary(m merger.Merged) string {
+	if m.Edits == 0 && m.Reads == 0 && m.Bash == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s edits · %s reads · %s bash",
+		fmtTokens(m.Edits), fmtTokens(m.Reads), fmtTokens(m.Bash))
+}
+
+// modelCostSuffix renders "  est=$X" for a model when its family is priced,
+// else empty.
+func modelCostSuffix(pricing pricingTable, mm domain.Model) string {
+	if c, ok := pricing.modelCost(mm); ok {
+		return "  est=" + fmtUSD(c)
+	}
+	return ""
+}
+
+// sessionActions renders a per-session action breakdown like "12e 3f 40r 8b"
+// (edits, files touched, reads, bash). Empty when the session did nothing.
+func sessionActions(s domain.SessionStat) string {
+	parts := make([]string, 0, 4)
+	if s.Edits > 0 {
+		parts = append(parts, fmt.Sprintf("%de", s.Edits))
+	}
+	if s.FilesTouched > 0 {
+		parts = append(parts, fmt.Sprintf("%df", s.FilesTouched))
+	}
+	if s.Reads > 0 {
+		parts = append(parts, fmt.Sprintf("%dr", s.Reads))
+	}
+	if s.Bash > 0 {
+		parts = append(parts, fmt.Sprintf("%db", s.Bash))
+	}
+	return strings.Join(parts, " ")
 }
 
 func short(d time.Duration) string {

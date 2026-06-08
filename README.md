@@ -113,11 +113,17 @@ Six tabs, or one dense dashboard view (default when terminal is ≥80×18):
    the chosen window; per-host attribution when two or more machines
    contributed to the same project; session count per project.
 3. **Models** — Opus vs Sonnet vs Haiku split, input/output/cache
-   columns, **cache hit rate**, distinct session count per model.
+   columns, **cache hit rate**, distinct session count per model, and an
+   **estimated USD cost** per model and overall (list price — override with
+   `--pricing`).
 4. **Hosts** — per-machine totals: tokens contributed, distinct
    projects, distinct sessions, freshness.
-5. **Sessions** — top 10 most expensive conversations in the window,
-   with project, model, duration, last-seen.
+5. **Sessions** — top 10 most expensive conversations in the window, each
+   with its **AI title** (what it was actually about), a **live dot** for
+   sessions touched in the last 5 minutes, per-session **cache hit rate**,
+   and an **action breakdown** (edits, files touched, reads, bash) so you
+   see what was done, not just how many tokens it cost. Account-level
+   edit/read/bash totals sit in the section header.
 6. **Hourly** — 24h sparkline plus 7d daily breakdown.
 
 Press `f` to filter to a single host (cycles through all → omen → pop-os
@@ -221,17 +227,28 @@ credentials are readable, Anthropic responds, SSH alias is reachable
 |------|---------|------|
 | `--dir` | `/var/lib/clawtop` | directory of per-machine status JSON files |
 | `--machine` | "" (all merged) | show only the named machine's data |
+| `--pricing` | "" (built-in) | JSON file overriding the per-million-token USD price estimates (see below) |
+
+Cost figures are **estimates** computed from token counts using public
+list prices (Opus $5/$25, Sonnet $3/$15, Haiku $1/$5 per 1M in/out; cache
+read ≈0.1×, cache write ≈1.25× input). They ignore plan discounts and can
+drift when prices change — always validate against your billing source.
+Override with a partial JSON map:
+
+```json
+{ "opus": { "in": 5, "out": 25, "cache_read": 0.5, "cache_write": 6.25 } }
+```
 
 Key bindings: `tab`/`shift-tab` or `←`/`→` cycle tabs, `1`–`6` jump
 directly, `t` toggle dashboard/tabbed, `f` cycle host filter,
 `j`/`k`/`g`/`G`/`PgUp`/`PgDn` scroll the project list, `r` reload, `q`
 quit.
 
-## Status JSON (schema 3)
+## Status JSON (schema 5)
 
 ```json
 {
-  "schema": 3,
+  "schema": 5,
   "machine": "omen",
   "ts": 1716688320,
   "session": { "pct": 31.0, "reset_at": 1716700000 },
@@ -252,9 +269,13 @@ quit.
   ],
   "hourly_24h": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 107835, 7436, 0, 0, 0, 0, 0, 0, 178055],
   "daily_7d":   [120000, 250000, 80000, 400000, 600000, 1100000, 1300000],
+  "edits": 144, "reads": 164, "bash": 466,
   "top_sessions": [
     { "id": "abc-...", "project": "rifeli", "model": "claude-opus-4-7",
-      "in": 186931, "out": 966588, "started_at": 1716680000, "last_at": 1716688000 }
+      "in": 186931, "out": 966588, "cache_read": 11664069, "cache_create": 240000,
+      "title": "Troubleshoot DVR camera configuration",
+      "edits": 14, "reads": 4, "bash": 22, "files_touched": 7,
+      "started_at": 1716680000, "last_at": 1716688000 }
   ]
 }
 ```

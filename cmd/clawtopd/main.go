@@ -202,6 +202,9 @@ func runDaemon(args []string) {
 			s.Heatmap = agg.Heatmap
 			s.WebSearch = agg.WebSearch
 			s.WebFetch = agg.WebFetch
+			s.Edits = agg.Edits
+			s.Reads = agg.Reads
+			s.Bash = agg.Bash
 		}
 
 		payload, _ := json.Marshal(s)
